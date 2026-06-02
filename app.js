@@ -1,176 +1,311 @@
+// ═══════════════════════════════════════════════════════════════
+// VaultIPFS — Blockchain + Multi-Password Architecture
+// ═══════════════════════════════════════════════════════════════
+//
+// PUBLIC CHAIN (Filebase IPFS - readable by anyone):
+//   genesis-block/{usernameHash}.json  →  {usernameHash, passwordHash, userId, chainHead, createdAt}
+//   chain/{userId}/block-{n}.json     →  {prevHash, vaultCID, action, timestamp}
+//
+// PRIVATE VAULT DATA (Filebase S3 - encrypted):
+//   vaults/{userId}/current.json      →  AES-256-GCM encrypted vault
+//   vaults/{userId}/block-{n}.json    →  historical encrypted snapshots
+//
+// LOCAL ONLY (localStorage - never leaves browser):
+//   secondary passwords (each encrypts vault key with different algorithm)
+//   session keys, auto-lock timer
+//
+// ═══════════════════════════════════════════════════════════════
+
 (function(){
 'use strict';
 const $=id=>document.getElementById(id);
 
-// ═══ CRYPTO ═══
-const Crypto=(()=>{
-  const ITER=600000,SALT=32,IV=12;
-  async function derive(pw,salt){
-    const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
-    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:ITER,hash:'SHA-512'},{name:'AES-GCM',length:256},km,false,['encrypt','decrypt']);
+// ═══ CONSTANTS ═══
+const S3_CFG={
+  AK:'F06A596A2552D11D018C',SK:'HmOUdPtZVOLRmy0sqyOMPAznybclyTIjKce7oltv',
+  BUCKET:'vault-storage',REGION:'us-east-1',HOST:'s3.filebase.com'
+};
+const IPFS_GW='https://gateway.filebase.io/ipfs/';
+const PBKDF2_ITER=600000;
+const SALT_SIZE=32,IV_SIZE=12;
+
+// ═══ CRYPTO HELPERS ═══
+function hex(buf){return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');}
+function toBuf(val){if(typeof val==='string')return new TextEncoder().encode(val);if(val instanceof Uint8Array)return val.buffer;if(val instanceof ArrayBuffer)return val;return new TextEncoder().encode(String(val));}
+async function hmac(key,data){const kb=toBuf(key),db=toBuf(data);const k=await crypto.subtle.importKey('raw',kb,{name:'HMAC',hash:'SHA-256'},false,['sign']);return new Uint8Array(await crypto.subtle.sign('HMAC',k,db));}
+async function sha256(data){return new Uint8Array(await crypto.subtle.digest('SHA-256',toBuf(data)));}
+async function sha256Hex(data){return hex(await sha256(data));}
+function genSalt(){return crypto.getRandomValues(new Uint8Array(SALT_SIZE));}
+function uuid(){return crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]%16;return(c==='x'?r:(r&0x3|0x8)).toString(16);});}
+
+// ═══ S3 CLIENT (SigV4) ═══
+const S3=(()=>{
+  async function getSigningKey(dt){let k=await hmac('AWS4'+S3_CFG.SK,dt);k=await hmac(k,S3_CFG.REGION);k=await hmac(k,'s3');return await hmac(k,'aws4_request');}
+  async function sign(method,path,payload,ct){
+    const now=new Date();const ts=now.toISOString().replace(/[:-]|\.\d{3}/g,'');const dt=ts.slice(0,8);
+    const payBuf=toBuf(payload||'');const ph=hex(await crypto.subtle.digest('SHA-256',payBuf));
+    const h={host:S3_CFG.HOST,'x-amz-date':ts,'x-amz-content-sha256':ph};if(ct)h['content-type']=ct;
+    const ks=Object.keys(h).sort();const ch=ks.map(k=>k+':'+h[k]).join('\n')+'\n';const sh=ks.join(';');
+    const cr=[method,path,'',ch,sh,ph].join('\n');const sc=dt+'/'+S3_CFG.REGION+'/s3/aws4_request';
+    const sts='AWS4-HMAC-SHA256\n'+ts+'\n'+sc+'\n'+hex(await crypto.subtle.digest('SHA-256',cr));
+    const sig=hex(await hmac(sts,await getSigningKey(dt)));
+    return{headers:{...h,'Authorization':'AWS4-HMAC-SHA256 Credential='+S3_CFG.AK+'/'+sc+', SignedHeaders='+sh+', Signature='+sig}};
   }
-  function genSalt(){return crypto.getRandomValues(new Uint8Array(SALT));}
-  async function enc(pw,salt,pt){
-    const key=await derive(pw,salt);
-    const iv=crypto.getRandomValues(new Uint8Array(IV));
+  async function put(key,data,ct){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('PUT',path,data,ct||'application/json');return fetch('https://'+S3_CFG.HOST+path,{method:'PUT',headers:r.headers,body:data});}
+  async function get(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('GET',path,'');const res=await fetch('https://'+S3_CFG.HOST+path,{headers:r.headers});return res.ok?res.text():null;}
+  async function del(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('DELETE',path,'');return fetch('https://'+S3_CFG.HOST+path,{method:'DELETE',headers:r.headers});}
+  return{put,get,del};
+})();
+
+// ═══ ENCRYPTION MODULES ═══
+const Cipher=(()=>{
+  // Primary: AES-256-GCM (PBKDF2-SHA512, 600k iter)
+  async function deriveKey(pw,salt,iter,hash){
+    const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:hash||'SHA-512'},{name:'AES-GCM',length:256},km,false,['encrypt','decrypt']);
+  }
+  async function encryptAES(pw,salt,pt){
+    const key=await deriveKey(pw,salt,PBKDF2_ITER,'SHA-512');
+    const iv=crypto.getRandomValues(new Uint8Array(IV_SIZE));
     const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(pt));
     return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
   }
-  async function dec(pw,salt,obj){
+  async function decryptAES(pw,salt,obj){
     try{
-      const key=await derive(pw,salt);
+      const key=await deriveKey(pw,salt,PBKDF2_ITER,'SHA-512');
       const iv=Uint8Array.from(atob(obj.iv),c=>c.charCodeAt(0));
       const data=Uint8Array.from(atob(obj.data),c=>c.charCodeAt(0));
       const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv},key,data);
       return new TextDecoder().decode(pt);
     }catch(e){return null;}
   }
+  // Secondary: AES-256-CBC (PBKDF2-SHA256, 100k iter) — different from primary
+  async function deriveKeyCBC(pw,salt){
+    const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:100000,hash:'SHA-256'},{name:'AES-CBC',length:256},km,false,['encrypt','decrypt']);
+  }
+  async function encryptCBC(pw,salt,pt){
+    const key=await deriveKeyCBC(pw,salt);
+    const iv=crypto.getRandomValues(new Uint8Array(16));
+    const ct=await crypto.subtle.encrypt({name:'AES-CBC',iv},key,new TextEncoder().encode(pt));
+    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
+  }
+  async function decryptCBC(pw,salt,obj){
+    try{
+      const key=await deriveKeyCBC(pw,salt);
+      const iv=Uint8Array.from(atob(obj.iv),c=>c.charCodeAt(0));
+      const data=Uint8Array.from(atob(obj.data),c=>c.charCodeAt(0));
+      const pt=await crypto.subtle.decrypt({name:'AES-CBC',iv},key,data);
+      return new TextDecoder().decode(pt);
+    }catch(e){return null;}
+  }
+  // Hash for blockchain (fast, for username/password verification)
   async function hash(pw,salt){
     const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits']);
     const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:100000,hash:'SHA-256'},km,256);
     return btoa(String.fromCharCode(...new Uint8Array(bits)));
   }
-  return{genSalt,enc,dec,hash,bufToB64:b=>btoa(String.fromCharCode(...new Uint8Array(b))),
-    b64toBuf:s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0)).buffer};
+  return{encryptAES,decryptAES,encryptCBC,decryptCBC,hash,genSalt};
 })();
 
-// ═══ FILEBASE S3 (browser SigV4) ═══
-const S3=(()=>{
-  const AK='F06A596A2552D11D018C';const SK='HmOUdPtZVOLRmy0sqyOMPAznybclyTIjKce7oltv';
-  const BUCKET='vault-storage';const REGION='us-east-1';const HOST='s3.filebase.com';
-  function hex(buf){return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');}
-  async function hmac(key,data){
-    const kb=typeof key==='string'?new TextEncoder().encode(key):(key instanceof Uint8Array?key.buffer:key);
-    const db=typeof data==='string'?new TextEncoder().encode(data):(data instanceof Uint8Array?data.buffer:data);
-    const k=await crypto.subtle.importKey('raw',kb,{name:'HMAC',hash:'SHA-256'},false,['sign']);
-    return new Uint8Array(await crypto.subtle.sign('HMAC',k,db));
+// ═══ BLOCKCHAIN ═══
+const Chain=(()=>{
+  // Public genesis block: stored at genesis/{usernameHash}.json
+  // Contains: usernameHash, passwordHash, userId, chainHead (CID of latest block), createdAt
+  async function createGenesis(username,password){
+    const usernameHash=await sha256Hex(username.toLowerCase().trim());
+    const salt=Cipher.genSalt();
+    const passwordHash=await Cipher.hash(password,salt);
+    const userId=uuid();
+    const genesis={
+      v:1,type:'genesis',
+      usernameHash,passwordHash,
+      salt:btoa(String.fromCharCode(...salt)),
+      userId,
+      chainHead:null,
+      createdAt:new Date().toISOString()
+    };
+    // Upload genesis block
+    await S3.put('genesis/'+usernameHash+'.json',JSON.stringify(genesis));
+    return{genesis,userId,usernameHash};
   }
-  async function getSigningKey(dt){
-    let k=await hmac('AWS4'+SK,dt);k=await hmac(k,REGION);k=await hmac(k,'s3');return await hmac(k,'aws4_request');
+  async function findGenesis(username){
+    const usernameHash=await sha256Hex(username.toLowerCase().trim());
+    const data=await S3.get('genesis/'+usernameHash+'.json');
+    if(!data)throw new Error('User not found');
+    return JSON.parse(data);
   }
-  async function sign(method,path,payload,ct){
-    const now=new Date();const ts=now.toISOString().replace(/[:-]|\.\d{3}/g,'');const dt=ts.slice(0,8);
-    const payBuf=typeof payload==='string'?new TextEncoder().encode(payload):new TextEncoder().encode('');
-    const ph=hex(await crypto.subtle.digest('SHA-256',payBuf));
-    const h={host:HOST,'x-amz-date':ts,'x-amz-content-sha256':ph};
-    if(ct)h['content-type']=ct;
-    const ks=Object.keys(h).sort();
-    const ch=ks.map(k=>k+':'+h[k]).join('\n')+'\n';
-    const sh=ks.join(';');
-    const cr=[method,path,'',ch,sh,ph].join('\n');
-    const sc=dt+'/'+REGION+'/s3/aws4_request';
-    const sts='AWS4-HMAC-SHA256\n'+ts+'\n'+sc+'\n'+hex(await crypto.subtle.digest('SHA-256',cr));
-    const sk=await getSigningKey(dt);
-    const sig=hex(await hmac(sts,sk));
-    return{headers:{...h,'Authorization':'AWS4-HMAC-SHA256 Credential='+AK+'/'+sc+', SignedHeaders='+sh+', Signature='+sig}};
+  async function verifyPassword(genesis,password){
+    const salt=Uint8Array.from(atob(genesis.salt),c=>c.charCodeAt(0));
+    const hash=await Cipher.hash(password,salt);
+    return hash===genesis.passwordHash;
   }
-  async function put(key,data){
-    const path='/'+BUCKET+'/'+key;
-    const r=await sign('PUT',path,data,'application/json');
-    return fetch('https://'+HOST+path,{method:'PUT',headers:r.headers,body:data});
+  // Add a new block to the chain
+  async function addBlock(userId,prevHash,vaultData,action){
+    const blockNum=Date.now();
+    const block={
+      v:1,type:'block',
+      userId,
+      blockNum,
+      prevHash,
+      action,  // 'create','update','delete','password-change'
+      vaultCID:null,  // will be set after vault upload
+      timestamp:new Date().toISOString()
+    };
+    const blockHash=await sha256Hex(JSON.stringify(block));
+    block.vaultCID='vaults/'+userId+'/block-'+blockNum+'.json';
+    await S3.put('chain/'+userId+'/block-'+blockNum+'.json',JSON.stringify(block));
+    return{block,blockHash};
   }
-  async function get(key){
-    const path='/'+BUCKET+'/'+key;
-    const r=await sign('GET',path,'');
-    const res=await fetch('https://'+HOST+path,{headers:r.headers});
-    return res.ok?res.text():null;
+  // Get chain head (latest block)
+  async function getChainHead(userId){
+    const data=await S3.get('chain/'+userId+'/head.json');
+    if(!data)return null;
+    return JSON.parse(data);
   }
-  return{put,get};
+  // Update chain head
+  async function setChainHead(userId,blockHash,blockNum){
+    await S3.put('chain/'+userId+'/head.json',JSON.stringify({blockHash,blockNum,updated:new Date().toISOString()}));
+  }
+  return{createGenesis,findGenesis,verifyPassword,addBlock,getChainHead,setChainHead};
 })();
 
-// ═══ BROWSER IDENTITY ═══
-const Identity=(()=>{
-  const KEY='v1identity';
-  function get(){
-    let id=localStorage.getItem(KEY);
-    if(!id){
-      const nav=navigator;
-      id=btoa([
-        nav.userAgent,nav.language,nav.hardwareConcurrency||'',
-        screen.width+'x'+screen.height,nav.platform,new Date().getTimezoneOffset()
-      ].join('|')).substring(0,32);
-      localStorage.setItem(KEY,id);
-    }
+// ═══ MULTI-PASSWORD SYSTEM ═══
+const Passwords=(()=>{
+  // Primary password: encrypts vault data with AES-256-GCM
+  // Secondary passwords: encrypt the VAULT KEY (not vault data) with different algorithms
+  // This way each password can independently decrypt the vault key → decrypt vault
+
+  const STORE_KEY='v1passwords';
+
+  function getStore(){
+    try{return JSON.parse(localStorage.getItem(STORE_KEY)||'{}');}catch(e){return{};}
+  }
+  function saveStore(s){localStorage.setItem(STORE_KEY,JSON.stringify(s));}
+
+  // Create primary password — returns encrypted vault key
+  async function createPrimary(userId,password){
+    const vaultKey=Cipher.genSalt(); // random 32-byte raw key for vault encryption
+    const vaultKeyStr=btoa(String.fromCharCode(...vaultKey));
+    // Encrypt the vault key string with user's password using AES-256-GCM
+    const encryptedKey=await Cipher.encryptAES(password,Cipher.genSalt(),vaultKeyStr);
+    const store=getStore();
+    store[userId]={primary:{encryptedKey,createdAt:new Date().toISOString()},secondaries:{}};
+    saveStore(store);
+    return{vaultKey,encryptedKey};
+  }
+
+  // Create secondary password — encrypts same vault key with different algorithm
+  async function createSecondary(userId,primaryPassword,secondaryPassword,label){
+    const store=getStore();
+    if(!store[userId])throw new Error('No primary password');
+    // Decrypt vault key with primary
+    const primaryData=store[userId].primary;
+    const vaultKeyStr=await Cipher.decryptAES(primaryPassword,Uint8Array.from(atob(primaryData.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:primaryData.encryptedKey.iv,data:primaryData.encryptedKey.data});
+    if(!vaultKeyStr)throw new Error('Wrong primary password');
+    // Re-encrypt vault key with secondary password using CBC (different from primary GCM)
+    const encryptedKey=await Cipher.encryptCBC(secondaryPassword,Cipher.genSalt(),vaultKeyStr);
+    const id=uuid();
+    store[userId].secondaries[id]={label:secondaryPassword.length<=6?'PIN':'Password',encryptedKey,createdAt:new Date().toISOString()};
+    saveStore(store);
     return id;
   }
-  function getLabel(){
-    const nav=navigator;
-    const os=nav.platform||'Unknown';
-    const lang=nav.language||'';
-    return os+' / '+lang;
+
+  // Unlock with any password — tries primary first, then secondaries
+  async function unlock(userId,password){
+    const store=getStore();
+    if(!store[userId])throw new Error('No passwords stored');
+    // Try primary
+    const p=store[userId].primary;
+    const vk=await Cipher.decryptAES(password,Uint8Array.from(atob(p.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:p.encryptedKey.iv,data:p.encryptedKey.data});
+    if(vk)return{vaultKey:btoa(String.fromCharCode(...Uint8Array.from(atob(vk),c=>c.charCodeAt(0)))),type:'primary'};
+    // Try secondaries
+    for(const id in store[userId].secondaries){
+      const s=store[userId].secondaries[id];
+      const vk2=await Cipher.decryptCBC(password,Uint8Array.from(atob(s.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:s.encryptedKey.iv,data:s.encryptedKey.data});
+      if(vk2)return{vaultKey:btoa(String.fromCharCode(...Uint8Array.from(atob(vk2),c=>c.charCodeAt(0)))),type:'secondary',id};
+    }
+    return null;
   }
-  return{get,getLabel};
+
+  // Get secondary password list (labels only, no keys)
+  function listSecondaries(userId){
+    const store=getStore();
+    if(!store[userId])return[];
+    return Object.keys(store[userId].secondaries||{}).map(id=>({id,label:store[userId].secondaries[id].label}));
+  }
+
+  // Remove secondary password
+  function removeSecondary(userId,id){
+    const store=getStore();
+    if(store[userId]&&store[userId].secondaries[id]){
+      delete store[userId].secondaries[id];
+      saveStore(store);
+    }
+  }
+
+  return{createPrimary,createSecondary,unlock,listSecondaries,removeSecondary};
 })();
 
-// ═══ STORAGE ═══
-const Store=(()=>{
-  const K={CID:'v1cid',SALT:'v1salt',CACHE:'v1cache',HASH:'v1hash'};
-  async function upload(data){
+// ═══ VAULT STORAGE ═══
+const Vault=(()=>{
+  // Vault data encrypted with vaultKey (random CryptoKey) using AES-GCM
+  async function importKey(rawKey){
+    return crypto.subtle.importKey('raw',rawKey,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  }
+  async function encryptVault(vaultKeyRaw,data){
+    const key=await importKey(vaultKeyRaw);
+    const iv=crypto.getRandomValues(new Uint8Array(IV_SIZE));
+    const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(data)));
+    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
+  }
+  async function decryptVault(vaultKeyRaw,obj){
     try{
-      const key=Identity.get()+'/vault-'+Date.now()+'.json';
-      const res=await S3.put(key,JSON.stringify(data));
-      if(res.ok){localStorage.setItem(K.CACHE,JSON.stringify(data));return key;}
-    }catch(e){}
-    const cid='local_'+Date.now();localStorage.setItem(K.CACHE,JSON.stringify(data));return cid;
+      const key=await importKey(vaultKeyRaw);
+      const iv=Uint8Array.from(atob(obj.iv),c=>c.charCodeAt(0));
+      const data=Uint8Array.from(atob(obj.data),c=>c.charCodeAt(0));
+      const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv},key,data);
+      return JSON.parse(new TextDecoder().decode(pt));
+    }catch(e){return null;}
   }
-  async function download(key){
-    if(key.startsWith('local_')){const c=localStorage.getItem(K.CACHE);return c?JSON.parse(c):null;}
-    try{const c=localStorage.getItem(K.CACHE);if(c)return JSON.parse(c);}catch(e){}
-    try{const d=await S3.get(key);if(d){const parsed=JSON.parse(d);localStorage.setItem(K.CACHE,JSON.stringify(parsed));return parsed;}}catch(e){}
-    try{const c=localStorage.getItem(K.CACHE);if(c)return JSON.parse(c);}catch(e){}
-    throw new Error('Cannot load vault from storage');
+  // Entry-level encryption for individual password fields
+  async function encryptEntry(vaultKeyRaw,plaintext){
+    const key=await importKey(vaultKeyRaw);
+    const iv=crypto.getRandomValues(new Uint8Array(IV_SIZE));
+    const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(plaintext));
+    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
   }
-  return{upload,download,
-    saveCID:c=>localStorage.setItem(K.CID,c),getCID:()=>localStorage.getItem(K.CID),
-    saveSalt:s=>localStorage.setItem(K.SALT,Crypto.bufToB64(s)),
-    getSalt:()=>{const s=localStorage.getItem(K.SALT);return s?Crypto.b64toBuf(s):null},
-    saveHash:h=>localStorage.setItem(K.HASH,h),getHash:()=>localStorage.getItem(K.HASH),
-    exists:()=>!!localStorage.getItem(K.SALT),
-    clear:()=>Object.values(K).forEach(k=>localStorage.removeItem(k))
-  };
+  async function decryptEntry(vaultKeyRaw,obj){
+    try{
+      const key=await importKey(vaultKeyRaw);
+      const iv=Uint8Array.from(atob(obj.iv),c=>c.charCodeAt(0));
+      const data=Uint8Array.from(atob(obj.data),c=>c.charCodeAt(0));
+      const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv},key,data);
+      return new TextDecoder().decode(pt);
+    }catch(e){return null;}
+  }
+  async function save(userId,vaultKeyRaw,vaultData){
+    const encrypted=await encryptVault(vaultKeyRaw,vaultData);
+    await S3.put('vaults/'+userId+'/current.json',JSON.stringify(encrypted));
+    const head=await Chain.getChainHead(userId);
+    const prevHash=head?head.blockHash:null;
+    const{block,blockHash}=await Chain.addBlock(userId,prevHash,null,'update');
+    await Chain.setChainHead(userId,blockHash,block.blockNum);
+    return block;
+  }
+  async function load(userId,vaultKeyRaw){
+    const data=await S3.get('vaults/'+userId+'/current.json');
+    if(!data)throw new Error('No vault found');
+    const decrypted=await decryptVault(vaultKeyRaw,JSON.parse(data));
+    if(!decrypted)throw new Error('Decrypt failed — wrong password');
+    return decrypted;
+  }
+  return{save,load,encryptVault,decryptVault,encryptEntry,decryptEntry};
 })();
 
-// ═══ MODEL ═══
-const M=(()=>{
-  let data={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:null};
-  function uuid(){return crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]%16;return(c==='x'?r:(r&0x3|0x8)).toString(16);});}
-  function touch(){data.updated=new Date().toISOString();}
-  return{
-    createEntry(d){const e={id:uuid(),type:d.type||'login',title:d.title||'',website:d.website||'',username:d.username||'',pwEnc:d.pwEnc||null,totp:d.totp||'',notes:d.notes||[],folderId:d.folderId||'',fav:false,del:false,pwStr:d.pwStr||0,created:new Date().toISOString(),updated:new Date().toISOString()};data.entries.push(e);touch();return e;},
-    getEntry(id){return data.entries.find(e=>e.id===id);},
-    updateEntry(id,u){const e=this.getEntry(id);if(!e)return null;Object.keys(u).forEach(k=>{if(k!=='id'&&k!=='created')e[k]=u[k];});e.updated=new Date().toISOString();touch();return e;},
-    deleteEntry(id){const e=this.getEntry(id);if(e){e.del=true;e.updated=new Date().toISOString();touch();}},
-    restoreEntry(id){const e=this.getEntry(id);if(e){e.del=false;e.updated=new Date().toISOString();touch();}},
-    purgeEntry(id){data.entries=data.entries.filter(e=>e.id!==id);touch();},
-    toggleFav(id){const e=this.getEntry(id);if(e){e.fav=!e.fav;e.updated=new Date().toISOString();touch();return e;}return null;},
-    createFolder(name){const f={id:uuid(),name:name||'Folder',created:new Date().toISOString()};data.folders.push(f);touch();return f;},
-    deleteFolder(id){data.folders=data.folders.filter(f=>f.id!==id);data.entries.forEach(e=>{if(e.folderId===id)e.folderId='';});touch();},
-    getFolder(id){return data.folders.find(f=>f.id===id);},
-    getFolders(){return[...data.folders];},
-    getEntries(view,search,type){
-      let e=data.entries;
-      if(view==='fav')e=e.filter(x=>x.fav&&!x.del);
-      else if(view==='trash')e=e.filter(x=>x.del);
-      else if(view==='recent'){e=e.filter(x=>!x.del);e.sort((a,b)=>new Date(b.updated)-new Date(a.updated));return e.slice(0,20);}
-      else if(view.startsWith('dir-'))e=e.filter(x=>x.folderId===view.slice(4)&&!x.del);
-      else e=e.filter(x=>!x.del);
-      if(type)e=e.filter(x=>x.type===type);
-      if(search){const q=search.toLowerCase();e=e.filter(x=>(x.title||'').toLowerCase().includes(q)||(x.website||'').toLowerCase().includes(q)||(x.username||'').toLowerCase().includes(q)||(x.notes||'').toLowerCase().includes(q));}
-      e.sort((a,b)=>new Date(b.updated)-new Date(a.updated));return e;
-    },
-    getStats(){const a=data.entries.filter(e=>!e.del);return{total:a.length,fav:a.filter(e=>e.fav).length,trash:data.entries.filter(e=>e.del).length,
-      byType:{login:a.filter(e=>e.type==='login').length,alias:a.filter(e=>e.type==='alias').length,note:a.filter(e=>e.type==='note').length,identity:a.filter(e=>e.type==='identity').length,card:a.filter(e=>e.type==='card').length}};},
-    getHealth(){const a=data.entries.filter(e=>!e.del&&e.pwEnc);if(!a.length)return{score:100,total:0,weak:0,strong:0};const w=a.filter(e=>e.pwStr>0&&e.pwStr<=2).length;return{score:Math.round(((a.length-w)/a.length)*100),total:a.length,weak:w,strong:a.length-w};},
-    exportJSON(){return JSON.parse(JSON.stringify(data));},
-    importJSON(d,mrg){if(!mrg){data={v:2,entries:d.entries||[],folders:d.folders||[],settings:d.settings||data.settings,updated:new Date().toISOString()};}else{const es=new Set(data.entries.map(e=>e.id));(d.entries||[]).forEach(e=>{if(!es.has(e.id))data.entries.push(e);});const fs=new Set(data.folders.map(f=>f.id));(d.folders||[]).forEach(f=>{if(!fs.has(f.id))data.folders.push(f);});}touch();},
-    getSettings(){return{...data.settings};},setSettings(u){Object.assign(data.settings,u);touch();},
-    getData(){return JSON.parse(JSON.stringify(data));},
-    setData(d){if(d&&typeof d==='object'){data=JSON.parse(JSON.stringify(d));data.v=2;touch();return true;}return false;}
-  };
-})();
-
-// ═══ STATE ═══
-var pw=null,salt=null;
+// ═══ APP STATE ═══
+var currentUser=null;  // {userId, username, vaultKey, genesis}
+var vaultData={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:null};
 var state={view:'all',type:'',search:''};
 var autoSaveTimer=null;
 var autoLockTimer=null;
@@ -186,7 +321,7 @@ function toast(msg,type){
   setTimeout(()=>{t.classList.add('out');setTimeout(()=>t.remove(),300);},3500);
 }
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function sBar(s){if(!s)return'';const c=s<=2?s===1?'var(--red)':'var(--orange)':s===3?'var(--yellow)':'var(--green)';return'<div class="strength-bar s'+s+'"><i></i></div>';}
+function sBar(s){if(!s)return'';return'<div class="strength-bar s'+s+'"><i></i></div>';}
 function favIco(url){if(!url)return'';try{const u=new URL(url.startsWith('http')?url:'https://'+url);return'https://www.google.com/s2/favicons?domain='+u.hostname+'&sz=64';}catch(e){return'';}}
 function tIcon(t){return'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'+({login:'<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',alias:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',note:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',identity:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',card:'<rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/>'})[t]||''+'</svg>';}
 function pwStr(p){let s=0;if(p.length>=8)s++;if(p.length>=12)s++;if(p.length>=16)s++;if(/[a-z]/.test(p))s++;if(/[A-Z]/.test(p))s++;if(/[0-9]/.test(p))s++;if(/[^a-zA-Z0-9]/.test(p))s++;return Math.min(4,Math.max(1,Math.floor(s/2)));}
@@ -208,21 +343,19 @@ function setSyncStatus(status){
 function scheduleAutoSave(){
   clearTimeout(autoSaveTimer);
   autoSaveTimer=setTimeout(async()=>{
-    if(!pw)return;
+    if(!currentUser)return;
     setSyncStatus('syncing');
-    try{await saveV();setSyncStatus('ok');}catch(e){setSyncStatus('error');}
-  },800);
+    try{await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);setSyncStatus('ok');}catch(e){setSyncStatus('error');}
+  },1000);
 }
 
 // ═══ AUTO-LOCK ═══
 function startAutoLock(){
   stopAutoLock();
-  const mins=M.getSettings().lock;
+  const mins=vaultData.settings.lock;
   if(!mins)return;
   autoLockTimer=setTimeout(()=>{
-    if(confirm('Auto-lock: Vault has been idle for '+mins+' minutes. Lock now?')){
-      lockVault();
-    }else{startAutoLock();}
+    if(confirm('Auto-lock: Vault idle for '+mins+' minutes. Lock now?')){lockVault();}else{startAutoLock();}
   },mins*60*1000);
 }
 function stopAutoLock(){if(autoLockTimer){clearTimeout(autoLockTimer);autoLockTimer=null;}}
@@ -231,76 +364,116 @@ function stopAutoLock(){if(autoLockTimer){clearTimeout(autoLockTimer);autoLockTi
 function showM(html){$('md').innerHTML=html;$('mbg').classList.add('show');document.body.style.overflow='hidden';}
 function closeM(){$('mbg').classList.remove('show');document.body.style.overflow='';}
 
-// ═══ SETUP ═══
-function showSetup(){
+// ═══ SIGNUP ═══
+function showSignup(){
   $('app').style.display='';$('loading').classList.add('hide');
-  document.body.insertAdjacentHTML('beforeend',`<div class="auth-screen" id="authScreen"><div class="auth-box"><div class="auth-logo"><div class="auth-logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg></div><h1>VaultIPFS</h1><p>Zero Trust Password Manager</p></div><div class="auth-steps"><div class="auth-step"><div class="auth-step-num">1</div><div><div class="auth-step-txt">Master Password</div><div class="auth-step-sub">Encrypts everything. Never leaves your browser.</div></div></div><div class="auth-step"><div class="auth-step-num">2</div><div><div class="auth-step-txt">Encrypted Cloud Storage</div><div class="auth-step-sub">AES-256-GCM encrypted. Stored on decentralized storage.</div></div></div><div class="auth-step"><div class="auth-step-num">3</div><div><div class="auth-step-txt">Zero Knowledge</div><div class="auth-step-sub">Only you hold the key. No one can read your passwords.</div></div></div></div><form class="auth-form" id="sf"><div class="form-group"><label>Master Password</label><input type="password" id="spw" placeholder="Min 8 characters" required autocomplete="new-password"></div><div class="form-group"><label>Confirm Password</label><input type="password" id="spw2" placeholder="Repeat password" required autocomplete="new-password"></div><div id="sStr"></div><div class="form-error" id="sErr"></div><button type="submit" class="btn-primary" style="width:100%;padding:12px;margin-top:4px">Create Vault</button></form><div class="auth-links"><a href="#" id="sImp">Import existing vault</a></div><input type="file" id="sF" accept=".json" style="display:none"></div></div>`);
+  document.body.insertAdjacentHTML('beforeend',`<div class="auth-screen" id="authScreen"><div class="auth-box"><div class="auth-logo"><div class="auth-logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg></div><h1>Create Account</h1><p>Your blockchain-secured vault</p></div><div class="auth-steps"><div class="auth-step"><div class="auth-step-num">1</div><div><div class="auth-step-txt">Choose Username</div><div class="auth-step-sub">Your unique identifier. Cannot be changed.</div></div></div><div class="auth-step"><div class="auth-step-num">2</div><div><div class="auth-step-txt">Master Password</div><div class="auth-step-sub">Encrypts your vault. Never stored on server.</div></div></div><div class="auth-step"><div class="auth-step-num">3</div><div><div class="auth-step-txt">Blockchain Genesis</div><div class="auth-step-sub">A new chain is created just for you on decentralized storage.</div></div></div></div><form class="auth-form" id="sf"><div class="form-group"><label>Username</label><input type="text" id="suser" placeholder="Choose a username" required autocomplete="username" minlength="3"></div><div class="form-group"><label>Master Password</label><input type="password" id="spw" placeholder="Min 8 characters" required autocomplete="new-password"></div><div class="form-group"><label>Confirm Password</label><input type="password" id="spw2" placeholder="Repeat password" required autocomplete="new-password"></div><div id="sStr"></div><div class="form-error" id="sErr"></div><button type="submit" class="btn-primary" style="width:100%;padding:12px;margin-top:4px">Create Account & Blockchain</button></form><div class="auth-links">Already have an account? <a href="#" id="sLogin">Sign In</a></div></div></div>`);
   $('spw').oninput=function(){const s=pwStr(this.value);const l=s<=2?s===1?'Weak':'Fair':s===3?'Good':'Strong';const c=s<=2?s===1?'var(--red)':'var(--orange)':s===3?'var(--yellow)':'var(--green)';$('sStr').innerHTML='<div class="strength-bar s'+s+'"><i></i></div><span style="font-size:11px;color:'+c+'">'+l+'</span>';};
   $('sf').onsubmit=async function(e){
-    e.preventDefault();const p1=$('spw').value,p2=$('spw2').value;
-    if(p1.length<8){$('sErr').textContent='Min 8 characters';return;}
+    e.preventDefault();
+    const username=$('suser').value.trim();const p1=$('spw').value,p2=$('spw2').value;
+    if(username.length<3){$('sErr').textContent='Username min 3 characters';return;}
+    if(p1.length<8){$('sErr').textContent='Password min 8 characters';return;}
     if(p1!==p2){$('sErr').textContent='Passwords do not match';return;}
-    salt=Crypto.genSalt();pw=p1;Store.saveSalt(salt);Store.saveHash(await Crypto.hash(pw,salt));
-    M.setData({v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:new Date().toISOString()});
-    await saveV();renderApp();
+    $('sErr').textContent='Creating blockchain...';$('sf').querySelector('button').disabled=true;
+    try{
+      // Check if user exists
+      try{await Chain.findGenesis(username);$('sErr').textContent='Username already taken';$('sf').querySelector('button').disabled=false;return;}catch(e){}
+      // Create genesis block + blockchain
+      const{genesis,userId,usernameHash}=await Chain.createGenesis(username,p1);
+      // Create primary password (encrypts vault key)
+      const{vaultKey}=await Passwords.createPrimary(userId,p1);
+      // Save empty vault
+      vaultData={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:new Date().toISOString()};
+      await Vault.save(userId,vaultKey,vaultData);
+      // Set current user
+      currentUser={userId,username,vaultKey,genesis};
+      localStorage.setItem('v1current',JSON.stringify({userId,username}));
+      renderApp();
+    }catch(err){$('sErr').textContent='Error: '+err.message;$('sf').querySelector('button').disabled=false;}
   };
-  $('sImp').onclick=e=>{e.preventDefault();$('sF').click();};
-  $('sF').onchange=async function(){const f=this.files[0];if(!f)return;const d=JSON.parse(await f.text());if(d&&d.entries){const p=prompt('Master password:');if(!p)return;salt=Crypto.genSalt();pw=p;Store.saveSalt(salt);Store.saveHash(await Crypto.hash(p,salt));M.setData(d);await saveV();renderApp();}else toast('Invalid file','error');};
+  $('sLogin').onclick=e=>{e.preventDefault();$('authScreen').remove();showLogin();};
 }
 
-// ═══ UNLOCK ═══
-function showUnlock(){
+// ═══ LOGIN ═══
+function showLogin(){
   $('app').style.display='';$('loading').classList.add('hide');
-  const sc=Store.getCID()||'';
-  document.body.insertAdjacentHTML('beforeend',`<div class="auth-screen" id="authScreen"><div class="auth-box"><div class="auth-logo"><div class="auth-logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg></div><h1>VaultIPFS</h1><p>Enter your master password</p></div><form class="auth-form" id="uf"><div class="form-group"><label>Master Password</label><input type="password" id="upw" placeholder="Enter master password" required autofocus autocomplete="current-password"></div><div class="form-group"><label>Storage Key <span style="font-weight:400;color:var(--fg4)">(optional — loads specific version)</span></label><input type="text" id="ucid" placeholder="vault-..." value="${sc}" style="font-family:monospace;font-size:12px"></div><div class="form-error" id="uErr"></div><button type="submit" class="btn-primary" style="width:100%;padding:12px;margin-top:4px">Unlock</button></form><div class="auth-links"><a href="#" id="uImp">Import file</a> &middot; <a href="#" id="uRes" style="color:var(--red)">Reset vault</a><br><br><a href="#" id="uForg" style="color:var(--fg4)">Forgot password?</a></div><input type="file" id="uF" accept=".json" style="display:none"></div></div>`);
+  document.body.insertAdjacentHTML('beforeend',`<div class="auth-screen" id="authScreen"><div class="auth-box"><div class="auth-logo"><div class="auth-logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M9 12l2 2 4-4" stroke-linecap="round"/></svg></div><h1>Welcome Back</h1><p>Unlock your vault</p></div><form class="auth-form" id="uf"><div class="form-group"><label>Username</label><input type="text" id="uuser" placeholder="Enter username" required autocomplete="username" autofocus></div><div class="form-group"><label>Password</label><input type="password" id="upw" placeholder="Enter password" required autocomplete="current-password"></div><div class="form-error" id="uErr"></div><button type="submit" class="btn-primary" style="width:100%;padding:12px;margin-top:4px">Unlock Vault</button></form><div class="auth-links"><a href="#" id="uForg" style="color:var(--fg4)">Forgot password?</a><br><br>No account? <a href="#" id="uSignup">Create one</a></div></div></div>`);
   $('uf').onsubmit=async function(e){
-    e.preventDefault();const p=$('upw').value;const cid=$('ucid').value.trim()||null;
-    salt=Store.getSalt();const sh=Store.getHash();
-    if(sh){const ih=await Crypto.hash(p,salt);if(ih!==sh){$('uErr').textContent='Wrong master password';return;}}
-    pw=p;try{await loadV(cid);renderApp();}catch(err){$('uErr').textContent=err.message||'Failed to load';pw=null;}
+    e.preventDefault();
+    const username=$('uuser').value.trim();const password=$('upw').value;
+    $('uErr').textContent='Fetching blockchain...';$('uf').querySelector('button').disabled=true;
+    try{
+      // Find genesis block by username hash
+      const genesis=await Chain.findGenesis(username);
+      // Verify password
+      const valid=await Chain.verifyPassword(genesis,password);
+      if(!valid){$('uErr').textContent='Wrong password';$('uf').querySelector('button').disabled=false;return;}
+      // Try to unlock with multi-password system
+      let unlockResult=await Passwords.unlock(genesis.userId,password);
+      let vaultKey;
+      if(unlockResult){
+        vaultKey=Uint8Array.from(atob(unlockResult.vaultKey),c=>c.charCodeAt(0));
+      }else{
+        // First login after migration — create primary password
+        const result=await Passwords.createPrimary(genesis.userId,password);
+        vaultKey=Uint8Array.from(atob(btoa(String.fromCharCode(...result.vaultKey))),c=>c.charCodeAt(0));
+      }
+      // Load vault
+      $('uErr').textContent='Decrypting vault...';
+      try{
+        vaultData=await Vault.load(genesis.userId,vaultKey);
+      }catch(err){
+        // Vault might not exist yet (new user)
+        vaultData={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:new Date().toISOString()};
+      }
+      currentUser={userId:genesis.userId,username,vaultKey,genesis};
+      localStorage.setItem('v1current',JSON.stringify({userId:genesis.userId,username}));
+      renderApp();
+    }catch(err){$('uErr').textContent='Error: '+err.message;$('uf').querySelector('button').disabled=false;}
   };
-  $('uImp').onclick=e=>{e.preventDefault();$('uF').click();};
-  $('uF').onchange=async function(){const f=this.files[0];if(!f)return;const d=JSON.parse(await f.text());if(d&&d.entries){const p=prompt('Master password:');if(!p)return;salt=Crypto.genSalt();pw=p;Store.saveSalt(salt);Store.saveHash(await Crypto.hash(p,salt));M.setData(d);await saveV();renderApp();}else toast('Invalid file','error');};
-  $('uRes').onclick=e=>{e.preventDefault();if(!confirm('⚠️ DELETE all local data? MUST have backup!'))return;if(!confirm('ABSOLUTELY sure?'))return;Store.clear();pw=null;salt=null;toast('Vault reset','info');setTimeout(()=>location.reload(),600);};
-  $('uForg').onclick=e=>{e.preventDefault();alert('No recovery. Master password is the only key.\n\nExport a backup file regularly.\n\nIf you lose your password, your vault is gone forever.');};
+  $('uForg').onclick=e=>{e.preventDefault();alert('No recovery. Your password is the only key.\n\nYour blockchain stores only a hash — we cannot reset it.\n\nIf you forget your password, your vault is permanently inaccessible.');};
+  $('uSignup').onclick=e=>{e.preventDefault();$('authScreen').remove();showSignup();};
 }
-
-// ═══ SAVE/LOAD ═══
-async function saveV(){
-  const d=M.getData();const e=await Crypto.enc(pw,salt,JSON.stringify(d));
-  e._m={v:2,t:new Date().toISOString()};const cid=await Store.upload(e);Store.saveCID(cid);return cid;
-}
-async function loadV(cidOvr){const cid=cidOvr||Store.getCID();if(!cid)throw new Error('No storage key');let e=await Store.download(cid);if(!e)throw new Error('No data');const d=await Crypto.dec(pw,salt,e);if(!d)throw new Error('Decrypt failed');M.setData(JSON.parse(d));}
 
 // ═══ LOCK ═══
 function lockVault(){
-  pw=null;salt=null;stopAutoLock();
-  $('app').style.display='none';showUnlock();
+  currentUser=null;vaultData={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:null};
+  stopAutoLock();$('app').style.display='none';showLogin();
 }
 
-// ═══ RENDER ═══
+// ═══ RENDER (same UI as before, using vaultData instead of M) ═══
 function renderApp(){
-  $('authScreen')?.remove();
-  $('app').style.display='';
-  applyTheme(M.getSettings().theme);
-  bindNav();renderE();updC();
-  startAutoLock();
+  $('authScreen')?.remove();$('app').style.display='';
+  applyTheme(vaultData.settings.theme);bindNav();renderE();updC();startAutoLock();
 }
-
 function applyTheme(t){document.documentElement.setAttribute('data-theme',t||'dark');}
 
-// ═══ NAV ═══
+function getEntries(view,search,type){
+  let e=vaultData.entries;
+  if(view==='fav')e=e.filter(x=>x.fav&&!x.del);
+  else if(view==='trash')e=e.filter(x=>x.del);
+  else if(view==='recent'){e=e.filter(x=>!x.del);e.sort((a,b)=>new Date(b.updated)-new Date(a.updated));return e.slice(0,20);}
+  else if(view.startsWith('dir-'))e=e.filter(x=>x.folderId===view.slice(4)&&!x.del);
+  else e=e.filter(x=>!x.del);
+  if(type)e=e.filter(x=>x.type===type);
+  if(search){const q=search.toLowerCase();e=e.filter(x=>(x.title||'').toLowerCase().includes(q)||(x.website||'').toLowerCase().includes(q)||(x.username||'').toLowerCase().includes(q)||(x.notes||'').toLowerCase().includes(q));}
+  e.sort((a,b)=>new Date(b.updated)-new Date(a.updated));return e;
+}
+function getStats(){const a=vaultData.entries.filter(e=>!e.del);return{total:a.length,fav:a.filter(e=>e.fav).length,trash:vaultData.entries.filter(e=>e.del).length,
+  byType:{login:a.filter(e=>e.type==='login').length,alias:a.filter(e=>e.type==='alias').length,note:a.filter(e=>e.type==='note').length,identity:a.filter(e=>e.type==='identity').length,card:a.filter(e=>e.type==='card').length}};}
+function getHealth(){const a=vaultData.entries.filter(e=>!e.del&&e.pwEnc);if(!a.length)return{score:100,total:0,weak:0,strong:0};const w=a.filter(e=>e.pwStr>0&&e.pwStr<=2).length;return{score:Math.round(((a.length-w)/a.length)*100),total:a.length,weak:w,strong:a.length-w};}
+
 function bindNav(){
   document.querySelectorAll('[data-view]').forEach(b=>{b.onclick=()=>{state.view=b.dataset.view;state.type='';updN();renderE();updT();};});
   document.querySelectorAll('[data-type]').forEach(b=>{b.onclick=()=>{state.type=b.dataset.type;state.view='all';updN();renderE();updT();};});
   let st;$('search').oninput=()=>{clearTimeout(st);st=setTimeout(()=>{state.search=$('search').value;renderE();},200);};
   $('btnAdd').onclick=()=>openEM(null);
-  $('btnNewFolder').onclick=()=>{const n=prompt('Folder name:');if(n){M.createFolder(n);bindNav();renderApp();toast('Folder created','success');}};
-  $('btnHealth').onclick=openHealth;
-  $('btnIO').onclick=openIO;
+  $('btnNewFolder').onclick=()=>{const n=prompt('Folder name:');if(n){vaultData.folders.push({id:uuid(),name:n,created:new Date().toISOString()});scheduleAutoSave();bindNav();renderApp();toast('Folder created','success');}};
+  $('btnHealth').onclick=openHealth;$('btnIO').onclick=openIO;
   $('btnLock').onclick=()=>{if(confirm('Lock vault?'))lockVault();};
   $('btnSettings').onclick=openSettings;
-  $('btnTheme').onclick=()=>{const t=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';applyTheme(t);M.setSettings({theme:t});};
+  $('btnTheme').onclick=()=>{const t=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';applyTheme(t);vaultData.settings.theme=t;scheduleAutoSave();};
   $('mobMenu').onclick=()=>{$('sidebar').classList.toggle('open');$('overlay').classList.toggle('show');};
   $('overlay').onclick=()=>{$('sidebar').classList.remove('open');$('overlay').classList.remove('show');};
   $('mbg').onclick=function(e){if(e.target===this)closeM();};
@@ -316,31 +489,26 @@ function updN(){document.querySelectorAll('.nav-item').forEach(b=>{b.classList.r
 function updT(){
   const t={all:'All Items',fav:'Favorites',recent:'Recent',trash:'Trash'};
   if(t[state.view])$('viewTitle').textContent=t[state.view];
-  else if(state.view.startsWith('dir-')){const f=M.getFolder(state.view.slice(4));$('viewTitle').textContent=f?f.name:'Folder';}
+  else if(state.view.startsWith('dir-')){const f=vaultData.folders.find(x=>x.id===state.view.slice(4));$('viewTitle').textContent=f?f.name:'Folder';}
   else if(state.type)$('viewTitle').textContent={login:'Logins',alias:'Aliases',note:'Notes',identity:'Identities',card:'Cards'}[state.type]||'Items';
   else $('viewTitle').textContent='All Items';
 }
 function updC(){
-  const s=M.getStats();
+  const s=getStats();
   const g=id=>$(id);if(g('cAll'))g('cAll').textContent=s.total;
-  if(g('cFav'))g('cFav').textContent=s.fav;
-  if(g('cTrash'))g('cTrash').textContent=s.trash;
-  if(g('cTlogin'))g('cTlogin').textContent=s.byType.login;
-  if(g('cTalias'))g('cTalias').textContent=s.byType.alias;
-  if(g('cTnote'))g('cTnote').textContent=s.byType.note;
-  if(g('cTidentity'))g('cTidentity').textContent=s.byType.identity;
+  if(g('cFav'))g('cFav').textContent=s.fav;if(g('cTrash'))g('cTrash').textContent=s.trash;
+  if(g('cTlogin'))g('cTlogin').textContent=s.byType.login;if(g('cTalias'))g('cTalias').textContent=s.byType.alias;
+  if(g('cTnote'))g('cTnote').textContent=s.byType.note;if(g('cTidentity'))g('cTidentity').textContent=s.byType.identity;
   if(g('cTcard'))g('cTcard').textContent=s.byType.card;
-  const folders=M.getFolders();
+  const folders=vaultData.folders||[];
   $('folderSection').style.display=folders.length?'':'none';
   const fl=$('folderList');
-  fl.innerHTML=folders.map(f=>`<button class="nav-item${state.view==='dir-'+f.id?' active':''}" data-view="dir-${f.id}">${tIcon('login')}<span>${esc(f.name)}</span><button onclick="event.stopPropagation();if(confirm('Delete?')){M.deleteFolder('${f.id}');renderApp();}" style="background:none;border:none;color:var(--fg4);font-size:14px;opacity:0;transition:opacity .15s">&times;</button></button>`).join('');
+  fl.innerHTML=folders.map(f=>`<button class="nav-item${state.view==='dir-'+f.id?' active':''}" data-view="dir-${f.id}">${tIcon('login')}<span>${esc(f.name)}</span></button>`).join('');
   fl.querySelectorAll('[data-view]').forEach(b=>{b.onclick=()=>{state.view=b.dataset.view;state.type='';updN();renderE();updT();};});
-  fl.querySelectorAll('.nav-item').forEach(b=>{b.onmouseenter=()=>{const btn=b.querySelector('button[onclick]');if(btn)btn.style.opacity=1;};b.onmouseleave=()=>{const btn=b.querySelector('button[onclick]');if(btn)btn.style.opacity=0;};});
 }
 
-// ═══ ENTRIES ═══
 function renderE(){
-  const entries=M.getEntries(state.view,state.search,state.type);
+  const entries=getEntries(state.view,state.search,state.type);
   const mb=$('mb');
   if(!entries.length){
     const msgs={all:'Your vault is empty',fav:'No favorites yet',recent:'No recent items',trash:'Trash is empty'};
@@ -349,44 +517,36 @@ function renderE(){
   }
   let h='<div class="cards-grid">';
   entries.forEach(e=>{
-    const fi=favIco(e.website);
-    const ic=fi?'<img src="'+fi+'" onerror="this.parentElement.innerHTML=tIcon(\''+e.type+'\')">':tIcon(e.type);
-    const fv=e.fav?'<span class="fav-star">★</span>':'';
-    const fo=M.getFolder(e.folderId);
+    const fi=favIco(e.website);const ic=fi?'<img src="'+fi+'" onerror="this.parentElement.innerHTML=tIcon(\''+e.type+'\')">':tIcon(e.type);
+    const fv=e.fav?'<span class="fav-star">★</span>':'';const fo=(vaultData.folders||[]).find(x=>x.id===e.folderId);
     h+=`<div class="card" data-id="${e.id}"><div class="card-inner"><div class="card-icon">${ic}${fv}</div><div class="card-info"><div class="card-title">${esc(e.title)}</div><div class="card-sub">${esc(e.username||e.website||e.type)}</div><div class="card-meta">${sBar(e.pwStr)}${fo?'<span class="folder-tag">'+esc(fo.name)+'</span>':''}</div></div><div class="card-actions">${e.pwEnc?'<button class="btn-icon cpw" data-id="'+e.id+'" title="Copy password"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>':''}${e.totp?'<button class="btn-icon gtotp" data-id="'+e.id+'" title="TOTP"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></button>':''}<button class="btn-icon menu-btn-card" data-id="${e.id}" title="More"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg></button></div></div></div>`;
   });
   h+='</div>';mb.innerHTML=h;
-  mb.querySelectorAll('.card').forEach(c=>{c.onclick=function(e){if(e.target.closest('.card-actions'))return;openEM(M.getEntry(c.dataset.id));};});
-  mb.querySelectorAll('.menu-btn-card').forEach(b=>{b.onclick=e=>{e.stopPropagation();showCtx(M.getEntry(b.dataset.id),b);};});
-  mb.querySelectorAll('.cpw').forEach(b=>{b.onclick=async e=>{e.stopPropagation();const en=M.getEntry(b.dataset.id);const d=await Crypto.dec(pw,salt,en.pwEnc);if(d){await copyT(d,M.getSettings().clip);toast('Password copied!','success');}else toast('Decrypt failed','error');};});
-  mb.querySelectorAll('.gtotp').forEach(b=>{b.onclick=async e=>{e.stopPropagation();const en=M.getEntry(b.dataset.id);if(en.totp){const c=await genTOTP(en.totp);await copyT(c,30);toast('TOTP: '+c,'info');}};});
+  mb.querySelectorAll('.card').forEach(c=>{c.onclick=function(e){if(e.target.closest('.card-actions'))return;openEM(vaultData.entries.find(x=>x.id===c.dataset.id));};});
+  mb.querySelectorAll('.menu-btn-card').forEach(b=>{b.onclick=e=>{e.stopPropagation();showCtx(vaultData.entries.find(x=>x.id===b.dataset.id),b);};});
+  mb.querySelectorAll('.cpw').forEach(b=>{b.onclick=async e=>{e.stopPropagation();const en=vaultData.entries.find(x=>x.id===b.dataset.id);const d=await Vault.decryptEntry(currentUser.vaultKey,en.pwEnc);if(d){await copyT(d,vaultData.settings.clip);toast('Password copied!','success');}else toast('Decrypt failed','error');};});
+  mb.querySelectorAll('.gtotp').forEach(b=>{b.onclick=async e=>{e.stopPropagation();const en=vaultData.entries.find(x=>x.id===b.dataset.id);if(en.totp){const c=await genTOTP(en.totp);await copyT(c,30);toast('TOTP: '+c,'info');}};});
 }
 
-// ═══ CONTEXT MENU ═══
 function showCtx(entry,btn){
   const menu=$('ctxMenu');
   menu.innerHTML=(entry.del?'':'<button data-a="edit"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit</button><button data-a="fav"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg> '+(entry.fav?'Unfavorite':'Favorite')+'</button>')+(entry.del?'<button data-a="res"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Restore</button>':'')+'<div class="ctx-divider"></div><button data-a="del" class="danger"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> '+(entry.del?'Delete Forever':'Trash')+'</button>';
-  menu.style.display='block';
-  const r=btn.getBoundingClientRect();
-  menu.style.left=Math.min(r.left,window.innerWidth-180)+'px';
-  menu.style.top=(r.bottom+6)+'px';
+  menu.style.display='block';const r=btn.getBoundingClientRect();menu.style.left=Math.min(r.left,window.innerWidth-180)+'px';menu.style.top=(r.bottom+6)+'px';
   menu.onclick=async e=>{
-    const a=e.target.closest('button')?.dataset.a;if(!a)return;
-    menu.style.display='none';
+    const a=e.target.closest('button')?.dataset.a;if(!a)return;menu.style.display='none';
     if(a==='edit')openEM(entry);
-    if(a==='fav'){M.toggleFav(entry.id);scheduleAutoSave();renderE();toast(entry.fav?'Removed from favorites':'Added to favorites','success');}
-    if(a==='res'){M.restoreEntry(entry.id);scheduleAutoSave();renderApp();toast('Restored','success');}
-    if(a==='del'){if(entry.del){if(!confirm('Permanently delete?'))return;M.purgeEntry(entry.id);}else{if(!confirm('Move to trash?'))return;M.deleteEntry(entry.id);}scheduleAutoSave();renderApp();}
+    if(a==='fav'){entry.fav=!entry.fav;entry.updated=new Date().toISOString();scheduleAutoSave();renderE();toast(entry.fav?'Favorited':'Unfavorited','success');}
+    if(a==='res'){entry.del=false;entry.updated=new Date().toISOString();scheduleAutoSave();renderApp();toast('Restored','success');}
+    if(a==='del'){if(entry.del){if(!confirm('Permanently delete?'))return;vaultData.entries=vaultData.entries.filter(x=>x.id!==entry.id);}else{entry.del=true;entry.updated=new Date().toISOString();}scheduleAutoSave();renderApp();}
   };
   setTimeout(()=>{document.addEventListener('click',function h(e){if(!menu.contains(e.target)){menu.style.display='none';document.removeEventListener('click',h);}});},10);
 }
 
-// ═══ ENTRY MODAL ═══
 var totpI=null;
 function openEM(entry){
   closeM();const ed=!!entry;
   const types=[{v:'login',l:'Login'},{v:'alias',l:'Alias'},{v:'note',l:'Secure Note'},{v:'identity',l:'Identity'},{v:'card',l:'Credit Card'}];
-  const fo=M.getFolders();const fopts=fo.map(f=>'<option value="'+f.id+'"'+(entry&&entry.folderId===f.id?' selected':'')+'>'+esc(f.name)+'</option>').join('');
+  const fo=vaultData.folders||[];const fopts=fo.map(f=>'<option value="'+f.id+'"'+(entry&&entry.folderId===f.id?' selected':'')+'>'+esc(f.name)+'</option>').join('');
   showM(`<div class="modal-header"><h2>${ed?'Edit Item':'Add New Item'}</h2><button class="modal-close" onclick="closeM()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
   <div class="modal-body"><form id="ef" autocomplete="off">
     <input type="hidden" id="eId" value="${entry?entry.id:''}">
@@ -395,12 +555,7 @@ function openEM(entry){
     <div class="form-group" id="fWeb"><label>Website URL</label><input id="eWeb" value="${entry?esc(entry.website||''):''}" placeholder="https://..."></div>
     <div class="form-group" id="fUser"><label>Username / Email</label><input id="eUser" value="${entry?esc(entry.username||''):''}"></div>
     <div class="form-group" id="fPw"><label>Password</label><div style="display:flex;gap:8px"><input id="ePw" type="password" value="" placeholder="${ed?'Leave blank to keep':'Enter password'}" style="flex:1"><button type="button" class="btn-secondary" id="btnTPw" style="padding:8px 12px">Show</button><button type="button" class="btn-secondary" id="btnGPw" style="padding:8px 12px">Gen</button></div><div id="pwStrBox" style="margin-top:6px"></div>
-      <div class="pw-gen" id="pwGB" style="display:none">
-        <div class="pw-gen-row"><label>Length</label><span id="pwLV">16</span></div>
-        <input type="range" class="pw-gen-slider" id="pwSL" min="8" max="64" value="16">
-        <div class="pw-gen-options"><label><input type="checkbox" id="pwC1" checked> ABC</label><label><input type="checkbox" id="pwC2" checked> abc</label><label><input type="checkbox" id="pwC3" checked> 123</label><label><input type="checkbox" id="pwC4" checked> #$%</label></div>
-        <button type="button" class="btn-secondary" id="btnUPw" style="margin-top:10px;width:100%">Use This Password</button>
-      </div>
+      <div class="pw-gen" id="pwGB" style="display:none"><div class="pw-gen-row"><label>Length</label><span id="pwLV">16</span></div><input type="range" class="pw-gen-slider" id="pwSL" min="8" max="64" value="16"><div class="pw-gen-options"><label><input type="checkbox" id="pwC1" checked> ABC</label><label><input type="checkbox" id="pwC2" checked> abc</label><label><input type="checkbox" id="pwC3" checked> 123</label><label><input type="checkbox" id="pwC4" checked> #$%</label></div><button type="button" class="btn-secondary" id="btnUPw" style="margin-top:10px;width:100%">Use This Password</button></div>
     </div>
     <div class="form-group" id="fTOTP"><label>TOTP Secret</label><div style="display:flex;gap:8px"><input id="eTOTP" value="${entry?esc(entry.totp||''):''}" placeholder="Base32 secret" style="flex:1"><button type="button" class="btn-secondary" id="btnGOTP" style="padding:8px 12px">Gen</button></div><div id="tpPrev"></div></div>
     <div class="form-group"><label>Folder</label><select id="eFolder"><option value="">None</option>${fopts}</select></div>
@@ -423,16 +578,22 @@ function openEM(entry){
     const title=$('eTitle').value.trim();if(!title){toast('Title required','error');return;}
     const type=$('eType').value;const ePw=$('ePw').value;
     if(type==='login'&&!ePw&&!ed){toast('Password required','error');return;}
-    const ed2={type,title,website:$('eWeb').value.trim(),username:$('eUser').value.trim(),pwEnc:ePw?await Crypto.enc(pw,salt,ePw):(entry?entry.pwEnc:null),totp:$('eTOTP').value.trim(),notes:$('eNotes').value.trim(),folderId:$('eFolder')?.value||'',pwStr:ePw?pwStr(ePw):(entry?entry.pwStr:0)};
-    if(ed)M.updateEntry(entry.id,ed2);else M.createEntry(ed2);
-    await saveV();closeM();renderApp();toast(ed?'Updated!':'Added!','success');
+    const now=new Date().toISOString();
+    if(ed){
+      const en=vaultData.entries.find(x=>x.id===$('eId').value);
+      if(en){en.type=type;en.title=title;en.website=$('eWeb').value.trim();en.username=$('eUser').value.trim();en.totp=$('eTOTP').value.trim();en.notes=$('eNotes').value.trim();en.folderId=$('eFolder').value;en.updated=now;if(ePw){en.pwEnc=await Vault.encryptEntry(currentUser.vaultKey,ePw);en.pwStr=pwStr(ePw);}}
+    }else{
+      const newEntry={id:uuid(),type,title,website:$('eWeb').value.trim(),username:$('eUser').value.trim(),pwEnc:ePw?await Vault.encryptEntry(currentUser.vaultKey,ePw):null,totp:$('eTOTP').value.trim(),notes:$('eNotes').value.trim(),folderId:$('eFolder').value,fav:false,del:false,pwStr:ePw?pwStr(ePw):0,created:now,updated:now};
+      vaultData.entries.push(newEntry);
+    }
+    vaultData.updated=now;await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);
+    closeM();renderApp();toast(ed?'Updated!':'Added!','success');
   };
 }
 function updFV(){const t=$('eType').value;$('fWeb').style.display=['login','alias'].includes(t)?'':'none';$('fUser').style.display=['login','alias','identity'].includes(t)?'':'none';$('fPw').style.display=t==='login'?'':'none';$('fTOTP').style.display=t==='login'?'':'none';}
 
-// ═══ HEALTH ═══
 function openHealth(){
-  const h=M.getHealth();const c=h.score>=80?'var(--green)':h.score>=50?'var(--orange)':'var(--red)';
+  const h=getHealth();const c=h.score>=80?'var(--green)':h.score>=50?'var(--orange)':'var(--red)';
   showM(`<div class="modal-header"><h2>Password Health</h2><button class="modal-close" onclick="closeM()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
   <div class="modal-body"><div style="text-align:center;margin-bottom:20px"><svg class="progress-ring" viewBox="0 0 56 56"><circle class="bg" cx="28" cy="28" r="24"/><circle class="fg" cx="28" cy="28" r="24" stroke-dasharray="150.8" stroke-dashoffset="${150.8*(1-h.score/100)}"/></svg><div style="font-size:36px;font-weight:800;color:${c}">${h.score}%</div><div style="color:var(--fg3);font-size:13px">Health Score</div></div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
@@ -443,44 +604,50 @@ function openHealth(){
   </div></div><div class="modal-footer"><button class="btn-secondary" onclick="closeM()">Close</button></div>`);
 }
 
-// ═══ IMPORT/EXPORT ═══
 function openIO(){
   showM(`<div class="modal-header"><h2>Import / Export</h2><button class="modal-close" onclick="closeM()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
-  <div class="modal-body">
-    <div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;margin-bottom:10px">Export</div><div style="display:flex;gap:8px"><button class="btn-primary" id="exJ" style="flex:1">Export JSON</button><button class="btn-secondary" id="exC" style="flex:1">Export CSV</button></div></div>
-    <div style="height:1px;background:var(--border);margin:16px 0"></div>
-    <div><div style="font-size:13px;font-weight:600;margin-bottom:10px">Import</div><button class="btn-secondary" id="imB" style="width:100%">Choose File</button><div style="font-size:11px;color:var(--fg4);margin-top:8px">Requires master password from original vault</div><div id="imR" style="margin-top:10px"></div></div>
-  </div><div class="modal-footer"><button class="btn-secondary" onclick="closeM()">Close</button></div>`);
-  $('exJ').onclick=()=>{const d=M.exportJSON();const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='vault-'+new Date().toISOString().slice(0,10)+'.json';a.click();toast('Exported!','success');};
-  $('exC').onclick=()=>{const e=M.getEntries();let c='title,type,website,username,notes\n';e.forEach(r=>{c+='"'+esc(r.title).replace(/"/g,'""')+'","'+r.type+'","'+esc(r.website||'').replace(/"/g,'""')+'","'+esc(r.username||'').replace(/"/g,'""')+'","'+esc(r.notes||'').replace(/"/g,'""')+'"\n';});const b=new Blob([c],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='vault-'+new Date().toISOString().slice(0,10)+'.csv';a.click();toast('CSV exported!','success');};
-  $('imB').onclick=()=>{const fi=document.createElement('input');fi.type='file';fi.accept='.json';fi.onchange=async()=>{try{const d=JSON.parse(await fi.files[0].text());if(d&&d.entries){M.importJSON(d,false);await saveV();$('imR').innerHTML='<div style="color:var(--green);font-size:13px">Imported '+d.entries.length+' items</div>';renderApp();}else $('imR').innerHTML='<div style="color:var(--red);font-size:13px">Invalid file</div>';}catch(er){$('imR').innerHTML='<div style="color:var(--red);font-size:13px">'+er.message+'</div>';}};fi.click();};
+  <div class="modal-body"><div style="margin-bottom:16px"><div style="font-size:13px;font-weight:600;margin-bottom:10px">Export</div><div style="display:flex;gap:8px"><button class="btn-primary" id="exJ" style="flex:1">Export JSON</button><button class="btn-secondary" id="exC" style="flex:1">Export CSV</button></div></div><div style="height:1px;background:var(--border);margin:16px 0"></div><div><div style="font-size:13px;font-weight:600;margin-bottom:10px">Import</div><button class="btn-secondary" id="imB" style="width:100%">Choose File</button><div id="imR" style="margin-top:10px"></div></div></div><div class="modal-footer"><button class="btn-secondary" onclick="closeM()">Close</button></div>`);
+  $('exJ').onclick=()=>{const b=new Blob([JSON.stringify(vaultData,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='vault-'+new Date().toISOString().slice(0,10)+'.json';a.click();toast('Exported!','success');};
+  $('exC').onclick=()=>{let c='title,type,website,username,notes\n';vaultData.entries.forEach(r=>{c+='"'+esc(r.title).replace(/"/g,'""')+'","'+r.type+'","'+esc(r.website||'').replace(/"/g,'""')+'","'+esc(r.username||'').replace(/"/g,'""')+'","'+esc(r.notes||'').replace(/"/g,'""')+'"\n';});const b=new Blob([c],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='vault-'+new Date().toISOString().slice(0,10)+'.csv';a.click();toast('CSV exported!','success');};
+  $('imB').onclick=()=>{const fi=document.createElement('input');fi.type='file';fi.accept='.json';fi.onchange=async()=>{try{const d=JSON.parse(await fi.files[0].text());if(d&&d.entries){const es=new Set(vaultData.entries.map(e=>e.id));d.entries.forEach(e=>{if(!es.has(e.id))vaultData.entries.push(e);});await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);$('imR').innerHTML='<div style="color:var(--green)">Imported '+d.entries.length+' items</div>';renderApp();}else $('imR').innerHTML='<div style="color:var(--red)">Invalid file</div>';}catch(er){$('imR').innerHTML='<div style="color:var(--red)">'+er.message+'</div>';}};fi.click();};
 }
 
-// ═══ SETTINGS ═══
 function openSettings(){
-  const s=M.getSettings();const cid=Store.getCID()||'Not saved';
+  const s=vaultData.settings;const cid=currentUser?currentUser.genesis.usernameHash:'N/A';
   showM(`<div class="modal-header"><h2>Settings</h2><button class="modal-close" onclick="closeM()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
   <div class="modal-body" style="padding-top:16px">
     <div class="setting-row"><span class="setting-label">Theme</span><button class="btn-secondary" id="stTh" style="padding:6px 14px;text-transform:capitalize">${s.theme}</button></div>
     <div class="setting-row"><span class="setting-label">Clipboard clear</span><select class="btn-secondary" id="stCl" style="padding:6px 10px"><option value="0"${s.clip===0?' selected':''}>Never</option><option value="15"${s.clip===15?' selected':''}>15s</option><option value="30"${s.clip===30?' selected':''}>30s</option><option value="60"${s.clip===60?' selected':''}>60s</option></select></div>
     <div class="setting-row"><span class="setting-label">Auto-lock</span><select class="btn-secondary" id="stLk" style="padding:6px 10px"><option value="0"${s.lock===0?' selected':''}>Never</option><option value="5"${s.lock===5?' selected':''}>5m</option><option value="15"${s.lock===15?' selected':''}>15m</option><option value="30"${s.lock===30?' selected':''}>30m</option><option value="60"${s.lock===60?' selected':''}>1h</option></select></div>
-    <div class="setting-row"><span class="setting-label">Browser ID</span><span class="setting-value">${Identity.get().substring(0,16)}...</span></div>
-    <div class="setting-row"><span class="setting-label">Storage Key</span><span class="setting-value">${cid.length>30?cid.substring(0,30)+'...':cid}</span></div>
-    <div class="setting-info">Your vault is encrypted with AES-256-GCM and stored on Filebase S3 (IPFS-backed decentralized storage). Only you hold the master password.</div>
+    <div class="setting-row"><span class="setting-label">Username</span><span class="setting-value">${currentUser?currentUser.username:'N/A'}</span></div>
+    <div class="setting-row"><span class="setting-label">User ID</span><span class="setting-value">${currentUser?currentUser.userId.substring(0,16)+'...':'N/A'}</span></div>
+    <div class="setting-row"><span class="setting-label">Chain Head</span><span class="setting-value">${cid.substring(0,20)}...</span></div>
+    <div class="setting-info">Your vault is encrypted with AES-256-GCM. The vault key is encrypted with your password. Each password uses a different encryption algorithm. Nothing is stored unencrypted on the server.</div>
   </div>
   <div style="padding:0 24px 20px"><button class="btn-secondary" id="btnSync" style="width:100%;margin-bottom:8px">Sync to Cloud Now</button></div>
   <div class="modal-footer"><button class="btn-secondary" onclick="closeM()">Close</button></div>`);
-  $('stTh').onclick=()=>{const t=['dark','light'];const i=t.indexOf(s.theme||'dark');const n=t[(i+1)%2];M.setSettings({theme:n});applyTheme(n);$('stTh').textContent=n;};
-  $('stCl').onchange=()=>M.setSettings({clip:+($('stCl').value)});
-  $('stLk').onchange=()=>{M.setSettings({lock:+($('stLk').value)});startAutoLock();};
-  $('btnSync').onclick=async()=>{setSyncStatus('syncing');try{await saveV();setSyncStatus('ok');toast('Synced to cloud!','success');openSettings();}catch(e){setSyncStatus('error');toast('Sync failed: '+e.message,'error');}};
+  $('stTh').onclick=()=>{const t=['dark','light'];const i=t.indexOf(s.theme||'dark');const n=t[(i+1)%2];applyTheme(n);s.theme=n;scheduleAutoSave();$('stTh').textContent=n;};
+  $('stCl').onchange=()=>{s.clip=+($('stCl').value);scheduleAutoSave();};
+  $('stLk').onchange=()=>{s.lock=+($('stLk').value);scheduleAutoSave();startAutoLock();};
+  $('btnSync').onclick=async()=>{setSyncStatus('syncing');try{await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);setSyncStatus('ok');toast('Synced!','success');openSettings();}catch(e){setSyncStatus('error');toast('Sync failed','error');}};
 }
 
 // ═══ INIT ═══
 document.addEventListener('DOMContentLoaded',function(){
   setTimeout(()=>{
     $('loading').classList.add('hide');
-    if(Store.exists()){showUnlock();}else{showSetup();}
+    // Check for existing session
+    try{
+      const saved=JSON.parse(localStorage.getItem('v1current'));
+      if(saved&&saved.userId){
+        // Try to restore session — need password
+        showLogin();
+        if(saved.username)$('uuser').value=saved.username;
+      }else{
+        // Check if any genesis blocks exist (returning user)
+        showLogin();
+      }
+    }catch(e){showLogin();}
   },800);
 });
 

@@ -220,7 +220,7 @@ a:hover{text-decoration:underline}
 .totp-bar>i{display:block;height:100%;background:var(--accent);transition:width 1s linear}
 
 /* ═══ AUTH SCREENS ═══ */
-.auth-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg)}
+.auth-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg);position:fixed;inset:0;z-index:999;overflow-y:auto}
 .auth-box{width:100%;max-width:420px}
 .auth-logo{text-align:center;margin-bottom:32px}
 .auth-logo-icon{width:56px;height:56px;margin:0 auto 16px;border-radius:50%;background:linear-gradient(135deg,var(--accent-glow),transparent);border:2px solid var(--accent);display:flex;align-items:center;justify-content:center}
