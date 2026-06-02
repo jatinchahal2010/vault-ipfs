@@ -35,27 +35,49 @@ const Crypto=(()=>{
     b64toBuf:s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0)).buffer};
 })();
 
+// ═══ FILEBASE S3 (browser SigV4) ═══
+const S3=(()=>{
+  const AK='F06A596A2552D11D018C';const SK='HmOUdPtZVOLRmy0sqyOMPAznybclyTIjKce7oltv';
+  const BUCKET='vault-storage';const REGION='us-east-1';const HOST='s3.filebase.com';
+  function hex(buf){return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');}
+  async function toBuf(val){if(typeof val==='string')return new TextEncoder().encode(val);if(val instanceof Uint8Array)return val.buffer;if(val instanceof ArrayBuffer)return val;return new TextEncoder().encode(String(val));}
+  async function hmac(key,data){const kb=await toBuf(key);const db=await toBuf(data);const k=await crypto.subtle.importKey('raw',kb,{name:'HMAC',hash:'SHA-256'},false,['sign']);return new Uint8Array(await crypto.subtle.sign('HMAC',k,db));}
+  async function getSigningKey(dt){let k=await hmac('AWS4'+SK,dt);k=await hmac(k,REGION);k=await hmac(k,'s3');return await hmac(k,'aws4_request');}
+  async function sign(method,path,payload,ct){
+    const now=new Date();const ts=now.toISOString().replace(/[:-]|\.\d{3}/g,'');const dt=ts.slice(0,8);
+    const payBuf=typeof payload==='string'?new TextEncoder().encode(payload):payload;
+    const ph=hex(await crypto.subtle.digest('SHA-256',payBuf));
+    const h={host:HOST,'x-amz-date':ts,'x-amz-content-sha256':ph};if(ct)h['content-type']=ct;
+    const ks=Object.keys(h).sort();const ch=ks.map(k=>k+':'+h[k])+'\n';const sh=ks.join(';');
+    const cr=[method,path,'',ch,sh,ph].join('\n');
+    const sc=dt+'/'+REGION+'/s3/aws4_request';
+    const sts='AWS4-HMAC-SHA256\n'+ts+'\n'+sc+'\n'+hex(await crypto.subtle.digest('SHA-256',cr));
+    const sk=await getSigningKey(dt);
+    const sig=hex(await hmac(sts,sk));
+    return{headers:{...h,'Authorization':'AWS4-HMAC-SHA256 Credential='+AK+'/'+sc+', SignedHeaders='+sh+', Signature='+sig}};
+  }
+  async function put(key,data){const path='/'+BUCKET+'/'+key;const r=await sign('PUT',path,data,'application/json');return fetch('https://'+HOST+path,{method:'PUT',headers:r.headers,body:data});}
+  async function get(key){const path='/'+BUCKET+'/'+key;const r=await sign('GET',path,'');const res=await fetch('https://'+HOST+path,{headers:r.headers});return res.ok?res.text():null;}
+  return{put,get};
+})();
+
 // ═══ STORAGE ═══
 const Store=(()=>{
-  const GW=['https://gateway.pinata.cloud/ipfs/','https://ipfs.io/ipfs/','https://dweb.link/ipfs/','https://cloudflare-ipfs.com/ipfs/'];
-  const PJWT='eyJhb...iic8';
   const K={CID:'v1cid',SALT:'v1salt',CACHE:'v1cache',HASH:'v1hash'};
   async function upload(data){
     try{
-      const fd=new FormData();
-      fd.append('file',new Blob([JSON.stringify(data)],{type:'application/json'}),'vault.json');
-      fd.append('pinataMetadata',JSON.stringify({name:'VaultIPFS'}));
-      const r=await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS',{method:'POST',headers:{'Authorization':'Bearer '+PJWT},body:fd});
-      if(r.ok){const j=await r.json();localStorage.setItem(K.CACHE,JSON.stringify(data));return j.IpfsHash;}
+      const key='vault-'+Date.now()+'.json';
+      const res=await S3.put(key,JSON.stringify(data));
+      if(res.ok){localStorage.setItem(K.CACHE,JSON.stringify(data));return key;}
     }catch(e){}
     const cid='local_'+Date.now();localStorage.setItem(K.CACHE,JSON.stringify(data));return cid;
   }
-  async function download(cid){
-    if(cid.startsWith('local_')){const c=localStorage.getItem(K.CACHE);return c?JSON.parse(c):null;}
+  async function download(key){
+    if(key.startsWith('local_')){const c=localStorage.getItem(K.CACHE);return c?JSON.parse(c):null;}
     try{const c=localStorage.getItem(K.CACHE);if(c)return JSON.parse(c);}catch(e){}
-    for(const g of GW){try{const r=await fetch(g+cid,{signal:AbortSignal.timeout(12000)});if(r.ok){const d=await r.json();localStorage.setItem(K.CACHE,JSON.stringify(d));return d;}}catch(e){}}
+    try{const d=await S3.get(key);if(d){localStorage.setItem(K.CACHE,JSON.stringify(JSON.parse(d)));return JSON.parse(d);}}catch(e){}
     try{const c=localStorage.getItem(K.CACHE);if(c)return JSON.parse(c);}catch(e){}
-    throw new Error('Cannot load vault from IPFS');
+    throw new Error('Cannot load vault from storage');
   }
   return {upload,download,
     saveCID:c=>localStorage.setItem(K.CID,c),getCID:()=>localStorage.getItem(K.CID),
@@ -133,7 +155,7 @@ function closeM(){$('mbg').classList.remove('show');document.body.style.overflow
 // ═══ SETUP ═══
 function showSetup(){
   $('app').style.display='';$('loading').style.display='none';
-  document.body.insertAdjacentHTML('beforeend',`<div class="aw" id="authScreen"><div class="ab"><div class="al"><h1>VaultIPFS</h1><p>Zero Trust &middot; Local Encryption &middot; IPFS Storage</p></div><div class="ais"><div class="step"><div class="num">1</div><div><div class="txt">Master Password</div><div class="sub">Encrypts everything. Never leaves your browser.</div></div></div><div class="step"><div class="num">2</div><div><div class="txt">Encrypted on IPFS</div><div class="sub">Pinned to decentralized storage. Permanent. Uncensorable.</div></div></div><div class="step"><div class="num">3</div><div><div class="txt">Zero Knowledge</div><div class="sub">Only you hold the key. No one can read your passwords.</div></div></div></div><form id="sf" style="display:flex;flex-direction:column;gap:10px"><div class="fg"><label>Master Password</label><input type="password" id="spw" placeholder="Min 8 characters" required autocomplete="new-password"></div><div class="fg"><label>Confirm Password</label><input type="password" id="spw2" placeholder="Repeat password" required autocomplete="new-password"></div><div id="sStr"></div><div class="fe" id="sErr"></div><button type="submit" class="btn bp bf" style="padding:12px">Create Vault</button></form><p style="text-align:center;margin-top:14px;font-size:12px;color:var(--c4)"><a href="#" id="sImp" style="color:var(--c3)">Import existing vault</a></p><input type="file" id="sF" accept=".json" style="display:none"></div></div>`);
+  document.body.insertAdjacentHTML('beforeend',`<div class="aw" id="authScreen"><div class="ab"><div class="al"><h1>VaultIPFS</h1><p>Zero Trust &middot; Local Encryption &middot; Decentralized Storage</p></div><div class="ais"><div class="step"><div class="num">1</div><div><div class="txt">Master Password</div><div class="sub">Encrypts everything. Never leaves your browser.</div></div></div><div class="step"><div class="num">2</div><div><div class="txt">Encrypted on IPFS</div><div class="sub">Pinned to decentralized storage. Permanent. Uncensorable.</div></div></div><div class="step"><div class="num">3</div><div><div class="txt">Zero Knowledge</div><div class="sub">Only you hold the key. No one can read your passwords.</div></div></div></div><form id="sf" style="display:flex;flex-direction:column;gap:10px"><div class="fg"><label>Master Password</label><input type="password" id="spw" placeholder="Min 8 characters" required autocomplete="new-password"></div><div class="fg"><label>Confirm Password</label><input type="password" id="spw2" placeholder="Repeat password" required autocomplete="new-password"></div><div id="sStr"></div><div class="fe" id="sErr"></div><button type="submit" class="btn bp bf" style="padding:12px">Create Vault</button></form><p style="text-align:center;margin-top:14px;font-size:12px;color:var(--c4)"><a href="#" id="sImp" style="color:var(--c3)">Import existing vault</a></p><input type="file" id="sF" accept=".json" style="display:none"></div></div>`);
   $('spw').oninput=function(){const s=pwStr(this.value);const l=s<=2?s===1?'Weak':'Fair':s===3?'Good':'Strong';const c=s<=2?s===1?'#ff4444':'#ffaa44':s===3?'#888':'#44ff88';$('sStr').innerHTML='<div class="str"><i style="width:'+(s/4*100)+'%;background:'+c+'"></i></div><span style="font-size:11px;color:'+c+'">'+l+'</span>';};
   $('sf').onsubmit=async function(e){
     e.preventDefault();const p1=$('spw').value,p2=$('spw2').value;
@@ -151,7 +173,7 @@ function showSetup(){
 function showUnlock(){
   $('app').style.display='';$('loading').style.display='none';
   const sc=Store.getCID()||'';
-  document.body.insertAdjacentHTML('beforeend',`<div class="aw" id="authScreen"><div class="ab"><div class="al"><h1>VaultIPFS</h1><p>Enter your master password</p></div><form id="uf" style="display:flex;flex-direction:column;gap:10px"><div class="fg"><label>Master Password</label><input type="password" id="upw" placeholder="Enter master password" required autofocus autocomplete="current-password"></div><div class="fg"><label>IPFS CID <span style="font-weight:400;color:var(--c4)">(optional — loads specific version)</span></label><input type="text" id="ucid" placeholder="Qm..." value="${sc}" style="font-family:monospace;font-size:12px"></div><div class="fe" id="uErr"></div><button type="submit" class="btn bp bf" style="padding:12px">Unlock</button></form><div style="margin-top:14px;text-align:center;font-size:12px"><p><a href="#" id="uImp" style="color:var(--c3)">Import file</a> &middot; <a href="#" id="uRes" style="color:#ff4444">Reset vault</a></p><p style="margin-top:6px"><a href="#" id="uForg" style="color:var(--c4)">Forgot password?</a></p></div><input type="file" id="uF" accept=".json" style="display:none"></div></div>`);
+  document.body.insertAdjacentHTML('beforeend',`<div class="aw" id="authScreen"><div class="ab"><div class="al"><h1>VaultIPFS</h1><p>Enter your master password</p></div><form id="uf" style="display:flex;flex-direction:column;gap:10px"><div class="fg"><label>Master Password</label><input type="password" id="upw" placeholder="Enter master password" required autofocus autocomplete="current-password"></div><div class="fg"><label>Storage Key <span style="font-weight:400;color:var(--c4)">(optional — loads specific version)</span></label><input type="text" id="ucid" placeholder="vault-..." value="${sc}" style="font-family:monospace;font-size:12px"></div><div class="fe" id="uErr"></div><button type="submit" class="btn bp bf" style="padding:12px">Unlock</button></form><div style="margin-top:14px;text-align:center;font-size:12px"><p><a href="#" id="uImp" style="color:var(--c3)">Import file</a> &middot; <a href="#" id="uRes" style="color:#ff4444">Reset vault</a></p><p style="margin-top:6px"><a href="#" id="uForg" style="color:var(--c4)">Forgot password?</a></p></div><input type="file" id="uF" accept=".json" style="display:none"></div></div>`);
   $('uf').onsubmit=async function(e){
     e.preventDefault();const p=$('upw').value;const cid=$('ucid').value.trim()||null;
     salt=Store.getSalt();const sh=Store.getHash();
@@ -309,14 +331,14 @@ function openSettings(){const s=M.getSettings();showM(`<div class="mhd"><h2>Sett
     <div class="sr"><span class="sl">Theme</span><button class="btn bg bs" id="stTh">${s.theme}</button></div>
     <div class="sr"><span class="sl">Clipboard clear</span><select class="bg" id="stCl" style="border:1px solid var(--bd);border-radius:var(--r);padding:6px 10px;font-size:12px"><option value="0"${s.clip===0?' selected':''}>Never</option><option value="15"${s.clip===15?' selected':''}>15s</option><option value="30"${s.clip===30?' selected':''}>30s</option><option value="60"${s.clip===60?' selected':''}>60s</option></select></div>
     <div class="sr"><span class="sl">Auto-lock</span><select class="bg" id="stLk" style="border:1px solid var(--bd);border-radius:var(--r);padding:6px 10px;font-size:12px"><option value="0"${s.lock===0?' selected':''}>Never</option><option value="5"${s.lock===5?' selected':''}>5m</option><option value="15"${s.lock===15?' selected':''}>15m</option><option value="30"${s.lock===30?' selected':''}>30m</option><option value="60"${s.lock===60?' selected':''}>1h</option></select></div>
-    <div class="sr"><span class="sl">IPFS CID</span><span class="sv" style="font-size:11px">${Store.getCID()||'Not saved'}</span></div>
+    <div class="sr"><span class="sl">Storage Key</span><span class="sv" style="font-size:11px">${Store.getCID()||'Not saved'}</span></div>
   </div>
-  <div style="padding:0 18px 18px"><button class="btn bg bf" id="btnSync" style="margin-bottom:8px">Sync to IPFS Now</button><p style="font-size:11px;color:var(--c4);text-align-center">Must unlock vault to sync</p></div>
+  <div style="padding:0 18px 18px"><button class="btn bg bf" id="btnSync" style="margin-bottom:8px">Sync to Cloud Now</button><p style="font-size:11px;color:var(--c4);text-align-center">Encrypted vault stored on Filebase S3 (IPFS-backed)</p></div>
   <div class="mft"><button class="btn bg" onclick="closeM()">Close</button></div>`);
   $('stTh').onclick=()=>{const t=['dark','light'];const i=t.indexOf(s.theme||'dark');const n=t[(i+1)%2];M.setSettings({theme:n});applyTheme(n);$('stTh').textContent=n;};
   $('stCl').onchange=()=>M.setSettings({clip:+($('stCl').value)});
   $('stLk').onchange=()=>M.setSettings({lock:+($('stLk').value)});
-  $('btnSync').onclick=async()=>{try{await saveV();toast('Synced to IPFS!','o');openSettings();}catch(e){toast('Sync failed: '+e.message,'e');}};
+  $('btnSync').onclick=async()=>{try{await saveV();toast('Synced to cloud!','o');openSettings();}catch(e){toast('Sync failed: '+e.message,'e');}};
 }
 
 // ═══ INIT ═══
