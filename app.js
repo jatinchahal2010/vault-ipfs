@@ -22,19 +22,52 @@ const $=id=>document.getElementById(id);
 
 // ═══ CONSTANTS ═══
 const S3_CFG={
-  AK:'F06A596A2552D11D018C',SK:'HmOUdPtZVOLRmy0sqyOMPAznybclyTIjKce7oltv',
-  BUCKET:'vault-storage',REGION:'us-east-1',HOST:'s3.filebase.com'
+  AK:'DA7F33AD883379297825',SK:'xSOU0s5Yfy9aBZhraaSxGG6Ls5ZSOBxPUw7JDQDI',
+  BUCKET:'vault-ipfs',REGION:'auto',HOST:'s3.filebase.io'
 };
 const IPFS_GW='https://gateway.filebase.io/ipfs/';
 const PBKDF2_ITER=600000;
 const SALT_SIZE=32,IV_SIZE=12;
 
 // ═══ CRYPTO HELPERS ═══
+// Pure JS SHA-256 (works identically in browser and Node.js)
+function sha256Pure(msg){
+  // For browser: use crypto.subtle (only for SHA-256, not HMAC)
+  // For Node.js: this won't be called since we use crypto.subtle directly
+  // This is a fallback — the actual signing uses crypto.subtle.digest for SHA-256
+  return null; // placeholder, not used
+}
 function hex(buf){return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');}
-function toBuf(val){if(typeof val==='string')return new TextEncoder().encode(val);if(val instanceof Uint8Array)return val.buffer;if(val instanceof ArrayBuffer)return val;return new TextEncoder().encode(String(val));}
-async function hmac(key,data){const kb=toBuf(key),db=toBuf(data);const k=await crypto.subtle.importKey('raw',kb,{name:'HMAC',hash:'SHA-256'},false,['sign']);return new Uint8Array(await crypto.subtle.sign('HMAC',k,db));}
-async function sha256(data){return new Uint8Array(await crypto.subtle.digest('SHA-256',toBuf(data)));}
-async function sha256Hex(data){return hex(await sha256(data));}
+function toBuf(val){
+  if(val===null||val===undefined)return new Uint8Array(0);
+  if(typeof val==='string')return new TextEncoder().encode(val);
+  if(val instanceof Uint8Array){const c=new Uint8Array(val.byteLength);c.set(val);return c;}
+  if(val instanceof ArrayBuffer)return new Uint8Array(val);
+  return new TextEncoder().encode(String(val));
+}
+// Use crypto.subtle.digest for SHA-256 (reliable) and crypto.subtle.importKey + sign for HMAC
+// BUT: crypto.subtle.sign has bugs in some environments, so we implement HMAC manually using digest
+async function hmac(key,data){
+  let kb=toBuf(key),db=toBuf(data);
+  const blockLen=64;
+  if(kb.byteLength>blockLen) kb=new Uint8Array(await crypto.subtle.digest('SHA-256',kb));
+  // kb is now exactly 32 bytes (or less), create clean copies
+  const k=new Uint8Array(blockLen);k.set(kb);
+  const d=new Uint8Array(db.byteLength);d.set(db);
+  const ipad=new Uint8Array(blockLen+d.byteLength);
+  const opad=new Uint8Array(blockLen+32);
+  for(let i=0;i<blockLen;i++){
+    const kv=i<k.byteLength?k[i]:0;
+    ipad[i]=kv^0x36;
+    opad[i]=kv^0x5c;
+  }
+  for(let i=0;i<d.byteLength;i++) ipad[blockLen+i]=d[i];
+  const innerHash=new Uint8Array(await crypto.subtle.digest('SHA-256',ipad));
+  for(let i=0;i<32;i++) opad[blockLen+i]=innerHash[i];
+  return new Uint8Array(await crypto.subtle.digest('SHA-256',opad));
+}
+async function sha256Buf(data){return await crypto.subtle.digest('SHA-256',toBuf(data));}
+async function sha256Hex(data){return hex(await sha256Buf(data));}
 function genSalt(){return crypto.getRandomValues(new Uint8Array(SALT_SIZE));}
 function uuid(){return crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]%16;return(c==='x'?r:(r&0x3|0x8)).toString(16);});}
 
@@ -43,17 +76,17 @@ const S3=(()=>{
   async function getSigningKey(dt){let k=await hmac('AWS4'+S3_CFG.SK,dt);k=await hmac(k,S3_CFG.REGION);k=await hmac(k,'s3');return await hmac(k,'aws4_request');}
   async function sign(method,path,payload,ct){
     const now=new Date();const ts=now.toISOString().replace(/[:-]|\.\d{3}/g,'');const dt=ts.slice(0,8);
-    const payBuf=toBuf(payload||'');const ph=hex(await crypto.subtle.digest('SHA-256',payBuf));
+    const payBuf=toBuf(payload);const ph=hex(await crypto.subtle.digest('SHA-256',payBuf));
     const h={host:S3_CFG.HOST,'x-amz-date':ts,'x-amz-content-sha256':ph};if(ct)h['content-type']=ct;
     const ks=Object.keys(h).sort();const ch=ks.map(k=>k+':'+h[k]).join('\n')+'\n';const sh=ks.join(';');
     const cr=[method,path,'',ch,sh,ph].join('\n');const sc=dt+'/'+S3_CFG.REGION+'/s3/aws4_request';
-    const sts='AWS4-HMAC-SHA256\n'+ts+'\n'+sc+'\n'+hex(await crypto.subtle.digest('SHA-256',cr));
+    const sts='AWS4-HMAC-SHA256\n'+ts+'\n'+sc+'\n'+hex(await crypto.subtle.digest('SHA-256',toBuf(cr)));
     const sig=hex(await hmac(sts,await getSigningKey(dt)));
     return{headers:{...h,'Authorization':'AWS4-HMAC-SHA256 Credential='+S3_CFG.AK+'/'+sc+', SignedHeaders='+sh+', Signature='+sig}};
   }
   async function put(key,data,ct){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('PUT',path,data,ct||'application/json');return fetch('https://'+S3_CFG.HOST+path,{method:'PUT',headers:r.headers,body:data});}
-  async function get(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('GET',path,'');const res=await fetch('https://'+S3_CFG.HOST+path,{headers:r.headers});return res.ok?res.text():null;}
-  async function del(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('DELETE',path,'');return fetch('https://'+S3_CFG.HOST+path,{method:'DELETE',headers:r.headers});}
+  async function get(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('GET',path,new Uint8Array(0));const res=await fetch('https://'+S3_CFG.HOST+path,{headers:r.headers});return res.ok?res.text():null;}
+  async function del(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('DELETE',path,new Uint8Array(0));return fetch('https://'+S3_CFG.HOST+path,{method:'DELETE',headers:r.headers});}
   return{put,get,del};
 })();
 
