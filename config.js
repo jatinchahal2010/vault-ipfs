@@ -15,10 +15,11 @@ const CONFIG = {
     HOST: 's3.filebase.io'
   },
 
-  // Optional: Cloudflare Worker CORS proxy URL
-  // Deploy worker.js to Cloudflare Workers and set the URL here
-  // Example: 'https://your-worker.your-subdomain.workers.dev/proxy'
-  CORS_PROXY: '',
+  // Cloudflare Worker CORS proxy URL
+  // This worker proxies S3 requests and adds CORS headers.
+  // Deploy worker.js to Cloudflare Workers and set the URL here.
+  // Your worker: royal-term-dfa3 (needs to be updated with latest worker.js)
+  CORS_PROXY: 'https://royal-term-dfa3.jatinchahal2010.workers.dev/proxy',
 
   // IPFS gateway for public chain data
   IPFS_GW: 'https://gateway.filebase.io/ipfs/',

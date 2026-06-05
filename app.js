@@ -425,7 +425,13 @@ function showSignup(){
       currentUser={userId,username,vaultKey,genesis};
       localStorage.setItem('v1current',JSON.stringify({userId,username}));
       renderApp();
-    }catch(err){$('sErr').textContent='Error: '+err.message;$('sf').querySelector('button').disabled=false;}
+    }catch(err){
+      let msg=err.message||'Unknown error';
+      if(!err.message||err.message==='Failed to fetch'||err.name==='TypeError'){
+        msg='Cannot connect to storage. Check CORS proxy settings or try again later.';
+      }
+      $('sErr').textContent='Error: '+msg;$('sf').querySelector('button').disabled=false;
+    }
   };
   $('sLogin').onclick=e=>{e.preventDefault();$('authScreen').remove();showLogin();};
 }
@@ -465,7 +471,13 @@ function showLogin(){
       currentUser={userId:genesis.userId,username,vaultKey,genesis};
       localStorage.setItem('v1current',JSON.stringify({userId:genesis.userId,username}));
       renderApp();
-    }catch(err){$('uErr').textContent='Error: '+err.message;$('uf').querySelector('button').disabled=false;}
+    }catch(err){
+      let msg=err.message||'Unknown error';
+      if(!err.message||err.message==='Failed to fetch'||err.name==='TypeError'){
+        msg='Cannot connect to storage. Check CORS proxy settings or try again later.';
+      }
+      $('uErr').textContent='Error: '+msg;$('uf').querySelector('button').disabled=false;
+    }
   };
   $('uForg').onclick=e=>{e.preventDefault();alert('No recovery. Your password is the only key.\n\nYour blockchain stores only a hash — we cannot reset it.\n\nIf you forget your password, your vault is permanently inaccessible.');};
   $('uSignup').onclick=e=>{e.preventDefault();$('authScreen').remove();showSignup();};
@@ -667,12 +679,44 @@ function openSettings(){
     <div class="setting-row"><span class="setting-label">Chain Head</span><span class="setting-value">${cid.substring(0,20)}...</span></div>
     <div class="setting-info">Your vault is encrypted with AES-256-GCM. The vault key is encrypted with your password. Each password uses a different encryption algorithm. Nothing is stored unencrypted on the server.</div>
   </div>
-  <div style="padding:0 24px 20px"><button class="btn-secondary" id="btnSync" style="width:100%;margin-bottom:8px">Sync to Cloud Now</button></div>
+  <div style="padding:0 24px 20px">
+    <button class="btn-secondary" id="btnTest" style="width:100%;margin-bottom:8px">Test Connection</button>
+    <div id="testResults" style="font-size:12px;margin-bottom:8px"></div>
+    <button class="btn-secondary" id="btnSync" style="width:100%;margin-bottom:8px">Sync to Cloud Now</button>
+  </div>
   <div class="modal-footer"><button class="btn-secondary" onclick="closeM()">Close</button></div>`);
   $('stTh').onclick=()=>{const t=['dark','light'];const i=t.indexOf(s.theme||'dark');const n=t[(i+1)%2];applyTheme(n);s.theme=n;scheduleAutoSave();$('stTh').textContent=n;};
   $('stCl').onchange=()=>{s.clip=+($('stCl').value);scheduleAutoSave();};
   $('stLk').onchange=()=>{s.lock=+($('stLk').value);scheduleAutoSave();startAutoLock();};
-  $('btnSync').onclick=async()=>{setSyncStatus('syncing');try{await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);setSyncStatus('ok');toast('Synced!','success');openSettings();}catch(e){setSyncStatus('error');toast('Sync failed','error');}};
+  $('btnSync').onclick=async()=>{setSyncStatus('syncing');try{await Vault.save(currentUser.userId,currentUser.vaultKey,vaultData);setSyncStatus('ok');toast('Synced!','success');openSettings();}catch(e){setSyncStatus('error');toast('Sync failed: '+e.message,'error');}};
+  $('btnTest').onclick=async()=>{
+    $('testResults').innerHTML='<span style="color:var(--accent)">Testing...</span>';
+    const results=await testConnection();
+    $('testResults').innerHTML=results.map(r=>'<div style="color:'+(r.ok?'var(--green)':'var(--red)')+'">'+(r.ok?'✓':'✗')+' '+r.name+': '+r.detail+'</div>').join('');
+  };
+}
+
+// ═══ CONNECTION TEST ═══
+async function testConnection(){
+  const results=[];
+  // Test 1: Direct S3
+  try{
+    const r=await S3.get('test-connection-check');
+    results.push({name:'Direct S3',ok:true,detail:r===null?'OK (no test file)':'OK'});
+  }catch(e){
+    results.push({name:'Direct S3',ok:false,detail:e.message});
+  }
+  // Test 2: CORS proxy (if configured)
+  if(CORS_PROXY){
+    try{
+      const path='/vault-ipfs/test-connection-check';
+      const r=await fetch(CORS_PROXY+path,{method:'GET'});
+      results.push({name:'CORS Proxy',ok:r.ok||r.status===404,detail:'HTTP '+r.status});
+    }catch(e){
+      results.push({name:'CORS Proxy',ok:false,detail:e.message});
+    }
+  }
+  return results;
 }
 
 // ═══ INIT ═══

@@ -4,27 +4,24 @@
 
 export default {
   async fetch(request) {
-    // Only allow requests from your GitHub Pages site
     const origin = request.headers.get('Origin') || '';
-    const allowedOrigins = [
-      'https://jatinchahal2010.github.io',
-      'http://localhost:8000'
-    ];
-    
-    if (!allowedOrigins.includes(origin)) {
-      return new Response('Forbidden', { status: 403 });
-    }
+
+    // Allow any origin from github.io, localhost, pages.dev, or any origin in dev
+    const isAllowed = !origin || // no origin (non-browser)
+      origin.includes('github.io') ||
+      origin.includes('localhost') ||
+      origin.includes('pages.dev') ||
+      origin.includes('127.0.0.1');
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': origin,
-          'Access-Control-Allow-Methods': 'GET, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Amz-Date, X-Amz-Content-Sha256',
-          'Access-Control-Max-Age': '86400'
-        }
-      });
+      const headers = new Headers();
+      headers.set('Access-Control-Allow-Origin', isAllowed ? origin : '*');
+      headers.set('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS');
+      headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Amz-Date, X-Amz-Content-Sha256, X-Amz-Security-Token');
+      headers.set('Access-Control-Max-Age', '86400');
+      headers.set('Vary', 'Origin');
+      return new Response(null, { status: 204, headers });
     }
 
     // Proxy the request to Filebase S3
@@ -32,24 +29,39 @@ export default {
     const s3Path = url.pathname.replace(/^\/proxy/, '');
     const s3Url = 'https://s3.filebase.io' + s3Path + url.search;
 
+    // Forward the request, stripping the Host header so S3 gets the right one
+    const fwdHeaders = new Headers(request.headers);
+    fwdHeaders.delete('Host');
+    fwdHeaders.set('Host', 's3.filebase.io');
+
     const proxyReq = new Request(s3Url, {
       method: request.method,
-      headers: request.headers,
-      body: request.body
+      headers: fwdHeaders,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined
     });
 
-    const response = await fetch(proxyReq);
-    
-    // Clone response and add CORS headers
-    const modified = new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    });
+    try {
+      const response = await fetch(proxyReq);
 
-    modified.headers.set('Access-Control-Allow-Origin', origin);
-    modified.headers.set('Access-Control-Expose-Headers', 'ETag, Content-Length');
+      // Clone response and add CORS headers
+      const modifiedHeaders = new Headers(response.headers);
+      modifiedHeaders.set('Access-Control-Allow-Origin', isAllowed ? origin : '*');
+      modifiedHeaders.set('Access-Control-Expose-Headers', 'ETag, Content-Length, x-amz-request-id, x-amz-id-2');
+      modifiedHeaders.set('Vary', 'Origin');
 
-    return modified;
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: modifiedHeaders
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message }), {
+        status: 502,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': isAllowed ? origin : '*'
+        }
+      });
+    }
   }
 };
