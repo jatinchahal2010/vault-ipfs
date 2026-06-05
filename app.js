@@ -20,14 +20,14 @@
 'use strict';
 const $=id=>document.getElementById(id);
 
-// ═══ CONSTANTS ═══
-const S3_CFG={
-  AK:'DA7F33AD883379297825',SK:'xSOU0s5Yfy9aBZhraaSxGG6Ls5ZSOBxPUw7JDQDI',
-  BUCKET:'vault-ipfs',REGION:'auto',HOST:'s3.filebase.io'
-};
-const IPFS_GW='https://gateway.filebase.io/ipfs/';
-const PBKDF2_ITER=600000;
-const SALT_SIZE=32,IV_SIZE=12;
+// ═══ CONFIGURATION ═══
+// Uses CONFIG from config.js if available, falls back to defaults
+const CFG=typeof CONFIG!=='undefined'?CONFIG:{S3:{AK:'DA7F33AD883379297825',SK:'xSOU0s5Yfy9aBZhraaSxGG6Ls5ZSOBxPUw7JDQDI',BUCKET:'vault-ipfs',REGION:'auto',HOST:'s3.filebase.io'},CORS_PROXY:'',IPFS_GW:'https://gateway.filebase.io/ipfs/',PBKDF2_ITERATIONS:600000,SALT_SIZE:32,IV_SIZE:12};
+const S3_CFG=CFG.S3;
+const CORS_PROXY=CFG.CORS_PROXY||'';
+const IPFS_GW=CFG.IPFS_GW;
+const PBKDF2_ITER=CFG.PBKDF2_ITERATIONS;
+const SALT_SIZE=CFG.SALT_SIZE,IV_SIZE=CFG.IV_SIZE;
 
 // ═══ CRYPTO HELPERS ═══
 // Pure JS SHA-256 (works identically in browser and Node.js)
@@ -84,9 +84,9 @@ const S3=(()=>{
     const sig=hex(await hmac(sts,await getSigningKey(dt)));
     return{headers:{...h,'Authorization':'AWS4-HMAC-SHA256 Credential='+S3_CFG.AK+'/'+sc+', SignedHeaders='+sh+', Signature='+sig}};
   }
-  async function put(key,data,ct){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('PUT',path,data,ct||'application/json');return fetch('https://'+S3_CFG.HOST+path,{method:'PUT',headers:r.headers,body:data});}
-  async function get(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('GET',path,new Uint8Array(0));const res=await fetch('https://'+S3_CFG.HOST+path,{headers:r.headers});return res.ok?res.text():null;}
-  async function del(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('DELETE',path,new Uint8Array(0));return fetch('https://'+S3_CFG.HOST+path,{method:'DELETE',headers:r.headers});}
+  async function put(key,data,ct){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('PUT',path,data,ct||'application/json');const url=CORS_PROXY?CORS_PROXY+path:'https://'+S3_CFG.HOST+path;return fetch(url,{method:'PUT',headers:r.headers,body:data});}
+  async function get(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('GET',path,new Uint8Array(0));const url=CORS_PROXY?CORS_PROXY+path:'https://'+S3_CFG.HOST+path;const res=await fetch(url,{headers:r.headers});return res.ok?res.text():null;}
+  async function del(key){const path='/'+S3_CFG.BUCKET+'/'+key;const r=await sign('DELETE',path,new Uint8Array(0));const url=CORS_PROXY?CORS_PROXY+path:'https://'+S3_CFG.HOST+path;return fetch(url,{method:'DELETE',headers:r.headers});}
   return{put,get,del};
 })();
 
@@ -361,7 +361,7 @@ function pwStr(p){let s=0;if(p.length>=8)s++;if(p.length>=12)s++;if(p.length>=16
 function genPW(len,o){len=len||16;o=o||{};let cs='',rq=[];if(o.up!==false){cs+='ABCDEFGHIJKLMNOPQRSTUVWXYZ';rq.push('ABCDEFGHIJKLMNOPQRSTUVWXYZ');}if(o.lo!==false){cs+='abcdefghijklmnopqrstuvwxyz';rq.push('abcdefghijklmnopqrstuvwxyz');}if(o.nu!==false){cs+='0123456789';rq.push('0123456789');}if(o.sy!==false){cs+='!@#$%^&*()_+-=[]{}|;:,.<>?';rq.push('!@#$%^&*()_+-=[]{}|;:,.<>?');}if(!cs)cs='abcdefghijklmnopqrstuvwxyz';len=Math.max(len,rq.length);const a=new Uint32Array(len*2);crypto.getRandomValues(a);let p='';let i=0;for(let j=0;j<rq.length;j++)p+=rq[j][a[i++]%rq[j].length];for(let j=rq.length;j<len;j++)p+=cs[a[i++]%cs.length];const arr=p.split('');for(let j=arr.length-1;j>0;j--){const k=a[i++]%(j+1);[arr[j],arr[k]]=[arr[k],arr[j]];}return arr.join('');}
 async function copyT(text,clear){try{await navigator.clipboard.writeText(text);if(clear>0)setTimeout(async()=>{try{await navigator.clipboard.writeText('');}catch(e){}},clear*1000);return true;}catch(e){return false;}}
 async function b32dec(input){const m='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';input=input.toUpperCase().replace(/=+$/,'');const o=[];let b=0,bi=0;for(let i=0;i<input.length;i++){const v=m.indexOf(input[i]);if(v<0)continue;b=(b<<5)|v;bi+=5;if(bi>=8){bi-=8;o.push((b>>>bi)&0xff);}}return new Uint8Array(o).buffer;}
-async function genTOTP(sec){try{const ts=Math.floor(Date.now()/1000/30);const key=await b32dec(sec);const buf=new ArrayBuffer(8);new DataView(buf).setUint32(4,ts,false);const hk=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-1'},false,['sign']);const h=await crypto.subtle.sign('HMAC',hk,key);const bv=new Uint8Array(h);const off=bv[19]&0x0f;const cd=(((bv[off]&0x7f)<<24)|((bv[off+1]&0xff)<<16)|((bv[off+2]&0xff)<<8)|(bv[off+3]&0xff))%1000000;return String(cd).padStart(6,'0');}catch(e){return'000000';}}
+async function genTOTP(sec){try{const ts=Math.floor(Date.now()/1000/30);const key=await b32dec(sec);const buf=new ArrayBuffer(8);new DataView(buf).setUint32(4,ts,false);const hk=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-1'},false,['sign']);const h=await crypto.subtle.sign('HMAC',hk,buf);const bv=new Uint8Array(h);const off=bv[19]&0x0f;const cd=(((bv[off]&0x7f)<<24)|((bv[off+1]&0xff)<<16)|((bv[off+2]&0xff)<<8)|(bv[off+3]&0xff))%1000000;return String(cd).padStart(6,'0');}catch(e){return'000000';}}
 function totpT(){return 30-(Math.floor(Date.now()/1000)%30);}
 
 // ═══ SYNC STATUS ═══
@@ -385,11 +385,13 @@ function scheduleAutoSave(){
 // ═══ AUTO-LOCK ═══
 function startAutoLock(){
   stopAutoLock();
+  resetAutoLock();
+}
+function resetAutoLock(){
+  stopAutoLock();
   const mins=vaultData.settings.lock;
   if(!mins)return;
-  autoLockTimer=setTimeout(()=>{
-    if(confirm('Auto-lock: Vault idle for '+mins+' minutes. Lock now?')){lockVault();}else{startAutoLock();}
-  },mins*60*1000);
+  autoLockTimer=setTimeout(()=>{lockVault();},mins*60*1000);
 }
 function stopAutoLock(){if(autoLockTimer){clearTimeout(autoLockTimer);autoLockTimer=null;}}
 
@@ -471,6 +473,8 @@ function showLogin(){
 
 // ═══ LOCK ═══
 function lockVault(){
+  // Clear sensitive data from memory
+  if(currentUser)currentUser.vaultKey=null;
   currentUser=null;vaultData={v:2,entries:[],folders:[],settings:{clip:30,lock:30,theme:'dark'},updated:null};
   stopAutoLock();$('app').style.display='none';showLogin();
 }
@@ -510,6 +514,12 @@ function bindNav(){
   $('mobMenu').onclick=()=>{$('sidebar').classList.toggle('open');$('overlay').classList.toggle('show');};
   $('overlay').onclick=()=>{$('sidebar').classList.remove('open');$('overlay').classList.remove('show');};
   $('mbg').onclick=function(e){if(e.target===this)closeM();};
+  // Activity tracking — reset auto-lock timer on any interaction
+  if(currentUser){
+    ['click','keydown','mousemove','touchstart'].forEach(ev=>{
+      document.addEventListener(ev,()=>{if(currentUser)resetAutoLock();},{passive:true});
+    });
+  }
   document.onkeydown=e=>{
     if(['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName))return;
     if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();$('search').focus();}
