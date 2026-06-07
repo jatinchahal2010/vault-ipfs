@@ -95,13 +95,13 @@ const Cipher=(()=>{
   // Primary: AES-256-GCM (PBKDF2-SHA512, 600k iter)
   async function deriveKey(pw,salt,iter,hash){
     const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
-    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:hash||'SHA-512'},{name:'AES-GCM',length:256},km,false,['encrypt','decrypt']);
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:iter,hash:hash||'SHA-512'},km,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
   }
   async function encryptAES(pw,salt,pt){
     const key=await deriveKey(pw,salt,PBKDF2_ITER,'SHA-512');
     const iv=crypto.getRandomValues(new Uint8Array(IV_SIZE));
     const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(pt));
-    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
+    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct))),salt:btoa(String.fromCharCode(...salt))};
   }
   async function decryptAES(pw,salt,obj){
     try{
@@ -115,13 +115,13 @@ const Cipher=(()=>{
   // Secondary: AES-256-CBC (PBKDF2-SHA256, 100k iter) — different from primary
   async function deriveKeyCBC(pw,salt){
     const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
-    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:100000,hash:'SHA-256'},{name:'AES-CBC',length:256},km,false,['encrypt','decrypt']);
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-CBC',length:256},false,['encrypt','decrypt']);
   }
   async function encryptCBC(pw,salt,pt){
     const key=await deriveKeyCBC(pw,salt);
     const iv=crypto.getRandomValues(new Uint8Array(16));
     const ct=await crypto.subtle.encrypt({name:'AES-CBC',iv},key,new TextEncoder().encode(pt));
-    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct)))};
+    return{iv:btoa(String.fromCharCode(...iv)),data:btoa(String.fromCharCode(...new Uint8Array(ct))),salt:btoa(String.fromCharCode(...salt))};
   }
   async function decryptCBC(pw,salt,obj){
     try{
@@ -285,7 +285,7 @@ const Passwords=(()=>{
     if(!store[userId])throw new Error('No primary password');
     // Decrypt vault key with primary
     const primaryData=store[userId].primary;
-    const vaultKeyStr=await Cipher.decryptAES(primaryPassword,Uint8Array.from(atob(primaryData.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:primaryData.encryptedKey.iv,data:primaryData.encryptedKey.data});
+    const vaultKeyStr=await Cipher.decryptAES(primaryPassword,Uint8Array.from(atob(primaryData.encryptedKey.salt),c=>c.charCodeAt(0)),{iv:primaryData.encryptedKey.iv,data:primaryData.encryptedKey.data});
     if(!vaultKeyStr)throw new Error('Wrong primary password');
     // Re-encrypt vault key with secondary password using CBC (different from primary GCM)
     const encryptedKey=await Cipher.encryptCBC(secondaryPassword,Cipher.genSalt(),vaultKeyStr);
@@ -301,12 +301,12 @@ const Passwords=(()=>{
     if(!store[userId])throw new Error('No passwords stored');
     // Try primary
     const p=store[userId].primary;
-    const vk=await Cipher.decryptAES(password,Uint8Array.from(atob(p.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:p.encryptedKey.iv,data:p.encryptedKey.data});
+    const vk=await Cipher.decryptAES(password,Uint8Array.from(atob(p.encryptedKey.salt),c=>c.charCodeAt(0)),{iv:p.encryptedKey.iv,data:p.encryptedKey.data});
     if(vk)return{vaultKey:btoa(String.fromCharCode(...Uint8Array.from(atob(vk),c=>c.charCodeAt(0)))),type:'primary'};
     // Try secondaries
     for(const id in store[userId].secondaries){
       const s=store[userId].secondaries[id];
-      const vk2=await Cipher.decryptCBC(password,Uint8Array.from(atob(s.encryptedKey.iv),c=>c.charCodeAt(0)),{iv:s.encryptedKey.iv,data:s.encryptedKey.data});
+      const vk2=await Cipher.decryptCBC(password,Uint8Array.from(atob(s.encryptedKey.salt),c=>c.charCodeAt(0)),{iv:s.encryptedKey.iv,data:s.encryptedKey.data});
       if(vk2)return{vaultKey:btoa(String.fromCharCode(...Uint8Array.from(atob(vk2),c=>c.charCodeAt(0)))),type:'secondary',id};
     }
     return null;
