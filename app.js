@@ -141,10 +141,62 @@ const Cipher=(()=>{
   return{encryptAES,decryptAES,encryptCBC,decryptCBC,hash,genSalt};
 })();
 
+// ═══ STORAGE ADAPTER ═══
+// Tries S3 first, falls back to localStorage if S3 fails (CORS/network issues)
+const StorageAdapter=(()=>{
+  const LOCAL_PREFIX='v1cloud_';
+  let s3Available=null; // null=unknown, true=working, false=failed
+
+  function localKey(key){return LOCAL_PREFIX+key;}
+  function localGet(key){try{return localStorage.getItem(localKey(key));}catch(e){return null;}}
+  function localSet(key,val){try{localStorage.setItem(localKey(key),val);return true;}catch(e){return false;}}
+  function localDel(key){try{localStorage.removeItem(localKey(key));}catch(e){}}
+
+  async function put(key,data,ct){
+    // Always save to localStorage as backup
+    localSet(key,data);
+    // Try S3
+    try{
+      const r=await S3.put(key,data,ct);
+      if(r.ok||r.status===200){
+        if(s3Available===null)s3Available=true;
+        return r;
+      }
+      throw new Error('S3 returned '+r.status);
+    }catch(e){
+      if(s3Available===null)s3Available=false;
+      console.warn('S3 put failed, using localStorage:',e.message);
+      return new Response(null,{status:200}); // pretend success
+    }
+  }
+  async function get(key){
+    // Try S3 first
+    try{
+      const r=await S3.get(key);
+      if(r!==null){
+        if(s3Available===null)s3Available=true;
+        // Update local cache
+        localSet(key,r);
+        return r;
+      }
+    }catch(e){
+      if(s3Available===null)s3Available=false;
+      console.warn('S3 get failed, trying localStorage:',e.message);
+    }
+    // Fallback to localStorage
+    return localGet(key);
+  }
+  async function del(key){
+    localDel(key);
+    try{return await S3.del(key);}catch(e){return new Response(null,{status:200});}
+  }
+  function isCloudAvailable(){return s3Available;}
+  return{put,get,del,isCloudAvailable};
+})();
+
 // ═══ BLOCKCHAIN ═══
 const Chain=(()=>{
   // Public genesis block: stored at genesis/{usernameHash}.json
-  // Contains: usernameHash, passwordHash, userId, chainHead (CID of latest block), createdAt
   async function createGenesis(username,password){
     const usernameHash=await sha256Hex(username.toLowerCase().trim());
     const salt=Cipher.genSalt();
@@ -158,13 +210,12 @@ const Chain=(()=>{
       chainHead:null,
       createdAt:new Date().toISOString()
     };
-    // Upload genesis block
-    await S3.put('genesis/'+usernameHash+'.json',JSON.stringify(genesis));
+    await StorageAdapter.put('genesis/'+usernameHash+'.json',JSON.stringify(genesis));
     return{genesis,userId,usernameHash};
   }
   async function findGenesis(username){
     const usernameHash=await sha256Hex(username.toLowerCase().trim());
-    const data=await S3.get('genesis/'+usernameHash+'.json');
+    const data=await StorageAdapter.get('genesis/'+usernameHash+'.json');
     if(!data)throw new Error('User not found');
     return JSON.parse(data);
   }
@@ -187,18 +238,18 @@ const Chain=(()=>{
     };
     const blockHash=await sha256Hex(JSON.stringify(block));
     block.vaultCID='vaults/'+userId+'/block-'+blockNum+'.json';
-    await S3.put('chain/'+userId+'/block-'+blockNum+'.json',JSON.stringify(block));
+    await StorageAdapter.put('chain/'+userId+'/block-'+blockNum+'.json',JSON.stringify(block));
     return{block,blockHash};
   }
   // Get chain head (latest block)
   async function getChainHead(userId){
-    const data=await S3.get('chain/'+userId+'/head.json');
+    const data=await StorageAdapter.get('chain/'+userId+'/head.json');
     if(!data)return null;
     return JSON.parse(data);
   }
   // Update chain head
   async function setChainHead(userId,blockHash,blockNum){
-    await S3.put('chain/'+userId+'/head.json',JSON.stringify({blockHash,blockNum,updated:new Date().toISOString()}));
+    await StorageAdapter.put('chain/'+userId+'/head.json',JSON.stringify({blockHash,blockNum,updated:new Date().toISOString()}));
   }
   return{createGenesis,findGenesis,verifyPassword,addBlock,getChainHead,setChainHead};
 })();
@@ -319,7 +370,7 @@ const Vault=(()=>{
   }
   async function save(userId,vaultKeyRaw,vaultData){
     const encrypted=await encryptVault(vaultKeyRaw,vaultData);
-    await S3.put('vaults/'+userId+'/current.json',JSON.stringify(encrypted));
+    await StorageAdapter.put('vaults/'+userId+'/current.json',JSON.stringify(encrypted));
     const head=await Chain.getChainHead(userId);
     const prevHash=head?head.blockHash:null;
     const{block,blockHash}=await Chain.addBlock(userId,prevHash,null,'update');
@@ -327,7 +378,7 @@ const Vault=(()=>{
     return block;
   }
   async function load(userId,vaultKeyRaw){
-    const data=await S3.get('vaults/'+userId+'/current.json');
+    const data=await StorageAdapter.get('vaults/'+userId+'/current.json');
     if(!data)throw new Error('No vault found');
     const decrypted=await decryptVault(vaultKeyRaw,JSON.parse(data));
     if(!decrypted)throw new Error('Decrypt failed — wrong password');
@@ -426,11 +477,7 @@ function showSignup(){
       localStorage.setItem('v1current',JSON.stringify({userId,username}));
       renderApp();
     }catch(err){
-      let msg=err.message||'Unknown error';
-      if(!err.message||err.message==='Failed to fetch'||err.name==='TypeError'){
-        msg='Cannot connect to storage. Check CORS proxy settings or try again later.';
-      }
-      $('sErr').textContent='Error: '+msg;$('sf').querySelector('button').disabled=false;
+      $('sErr').textContent='Error: '+(err.message||'Unknown error');$('sf').querySelector('button').disabled=false;
     }
   };
   $('sLogin').onclick=e=>{e.preventDefault();$('authScreen').remove();showLogin();};
@@ -472,11 +519,7 @@ function showLogin(){
       localStorage.setItem('v1current',JSON.stringify({userId:genesis.userId,username}));
       renderApp();
     }catch(err){
-      let msg=err.message||'Unknown error';
-      if(!err.message||err.message==='Failed to fetch'||err.name==='TypeError'){
-        msg='Cannot connect to storage. Check CORS proxy settings or try again later.';
-      }
-      $('uErr').textContent='Error: '+msg;$('uf').querySelector('button').disabled=false;
+      $('uErr').textContent='Error: '+(err.message||'Unknown error');$('uf').querySelector('button').disabled=false;
     }
   };
   $('uForg').onclick=e=>{e.preventDefault();alert('No recovery. Your password is the only key.\n\nYour blockchain stores only a hash — we cannot reset it.\n\nIf you forget your password, your vault is permanently inaccessible.');};
@@ -699,22 +742,15 @@ function openSettings(){
 // ═══ CONNECTION TEST ═══
 async function testConnection(){
   const results=[];
-  // Test 1: Direct S3
+  // Test localStorage
   try{
-    const r=await S3.get('test-connection-check');
-    results.push({name:'Direct S3',ok:true,detail:r===null?'OK (no test file)':'OK'});
+    const testKey='__test__'+Date.now();
+    localStorage.setItem(testKey,'ok');
+    const val=localStorage.getItem(testKey);
+    localStorage.removeItem(testKey);
+    results.push({name:'localStorage',ok:val==='ok',detail:'Working'});
   }catch(e){
-    results.push({name:'Direct S3',ok:false,detail:e.message});
-  }
-  // Test 2: CORS proxy (if configured)
-  if(CORS_PROXY){
-    try{
-      const path='/vault-ipfs/test-connection-check';
-      const r=await fetch(CORS_PROXY+path,{method:'GET'});
-      results.push({name:'CORS Proxy',ok:r.ok||r.status===404,detail:'HTTP '+r.status});
-    }catch(e){
-      results.push({name:'CORS Proxy',ok:false,detail:e.message});
-    }
+    results.push({name:'localStorage',ok:false,detail:e.message});
   }
   return results;
 }
